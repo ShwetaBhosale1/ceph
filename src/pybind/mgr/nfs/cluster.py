@@ -18,8 +18,17 @@ from .utils import (
     available_clusters,
     conf_obj_name,
     restart_nfs_service,
-    user_conf_obj_name)
-from .export import NFSRados
+    user_conf_obj_name,
+    USER_CONF_PREFIX,
+    qos_conf_obj_name)
+from .rados_utils import NFSRados
+from .ganesha_conf import (
+    format_block,
+    GaneshaConfParser,
+    QOS,
+    QOSType,
+    qos_bandwidth_checks,
+    QOSParams)
 
 if TYPE_CHECKING:
     from nfs.module import Module
@@ -57,6 +66,7 @@ def create_ganesha_pool(mgr: 'MgrModule') -> None:
 class NFSCluster:
     def __init__(self, mgr: 'Module') -> None:
         self.mgr = mgr
+        self._qos: dict[str, QOS] = {}
 
     def _call_orch_apply_nfs(
             self,
@@ -273,7 +283,7 @@ class NFSCluster:
         try:
             if cluster_id in available_clusters(self.mgr):
                 rados_obj = self._rados(cluster_id)
-                if rados_obj.check_user_config():
+                if rados_obj.check_config(USER_CONF_PREFIX):
                     raise NonFatalError("NFS-Ganesha User Config already exists")
                 rados_obj.write_obj(nfs_config, user_conf_obj_name(cluster_id),
                                     conf_obj_name(cluster_id))
@@ -291,7 +301,7 @@ class NFSCluster:
         try:
             if cluster_id in available_clusters(self.mgr):
                 rados_obj = self._rados(cluster_id)
-                if not rados_obj.check_user_config():
+                if not rados_obj.check_config(USER_CONF_PREFIX):
                     raise NonFatalError("NFS-Ganesha User Config does not exist")
                 rados_obj.remove_obj(user_conf_obj_name(cluster_id),
                                      conf_obj_name(cluster_id))
@@ -307,3 +317,108 @@ class NFSCluster:
     def _rados(self, cluster_id: str) -> NFSRados:
         """Return a new NFSRados object for the given cluster id."""
         return NFSRados(self.mgr.rados, cluster_id)
+
+    def get_cluster_qos_config(self, cluster_id: str) -> Optional[QOS]:
+        """Return QOS object for the given cluster id."""
+        if cluster_id not in self._qos:
+            rados_obj = self._rados(cluster_id)
+            conf = rados_obj.read_obj(qos_conf_obj_name(cluster_id))
+            if conf:
+                qos_block = GaneshaConfParser(conf).parse()
+                qos_obj = QOS.from_qos_block(qos_block[0], True)
+                self._qos[cluster_id] = qos_obj
+            else:
+                return None
+        return self._qos[cluster_id]
+
+    def update_cluster_qos(self,
+                           cluster_id: str,
+                           enable_qos: bool,
+                           enable_bw_ctrl: bool,
+                           combined_bw_ctrl: bool,
+                           qos_type: Optional[QOSType] = None,
+                           **kwargs: Any) -> None:
+        """Update cluster QOS config"""
+        qos_obj_exists = False
+        qos_obj = self.get_cluster_qos_config(cluster_id)
+        if not qos_obj:
+            log.debug(f"Creating new QOS block for cluster {cluster_id}")
+            qos_obj = QOS(True, enable_qos, enable_bw_ctrl, combined_bw_ctrl, qos_type, **kwargs)
+        else:
+            log.debug(f"Updating existing QOS block for cluster {cluster_id}")
+            qos_obj_exists = True
+            qos_obj.enable_qos = enable_qos
+            qos_obj.enable_bw_ctrl = enable_bw_ctrl
+            qos_obj.combined_bw_ctrl = combined_bw_ctrl
+            qos_obj.qos_type = qos_type
+            if kwargs:
+                qos_obj.update_bandwidths(**kwargs)
+            else:
+                qos_obj.update_bandwidths('0', '0', '0', '0', '0', '0')
+
+        qos_config = format_block(qos_obj.to_qos_block())
+        rados_obj = self._rados(cluster_id)
+        if not qos_obj_exists:
+            rados_obj.write_obj(qos_config, qos_conf_obj_name(cluster_id),
+                                conf_obj_name(cluster_id))
+        else:
+            rados_obj.update_obj(qos_config, qos_conf_obj_name(cluster_id),
+                                 conf_obj_name(cluster_id), should_notify=False)
+        log.debug(f"Successfully saved {cluster_id}s QOS bandwidth control config: \n {qos_config}")
+
+    def enable_nfs_cluster_qos(self,
+                               cluster_id: str,
+                               qos_type: QOSType,
+                               combined_bw_ctrl: bool,
+                               **kwargs: Any
+                               ) -> list[str]:
+        """
+        There are 2 cases to consider:
+        1. If combined bandwith control is disabled
+            a. If qos_type is pershare, then export_writebw and export_readbw parameters are compulsory
+            b. If qos_type is perclient, then client_writebw and client_readbw parameters are compulsory
+            c. If qos_type is pershare_perclient then export_writebw, export_readbw, client_writebw and
+               client_readbw are compulsory parameters
+        2. If combined bandwidth control is enabled
+            a. If qos_type is pershare, then export_rw_bw parameter is compulsory
+            b. If qos_type is perclient, then client_rw_bw parameter is compulsory
+            c. If qos_type is pershare_perclient, then export_rw_bw and client_rw_bw parameters are compulsory
+        """
+        try:
+            params = {}
+            for key in kwargs:
+                params[QOSParams[key].value] = kwargs[key]
+            qos_bandwidth_checks(qos_type, combined_bw_ctrl, **params)
+            if cluster_id in available_clusters(self.mgr):
+                self.update_cluster_qos(cluster_id, True, True, combined_bw_ctrl, qos_type, **kwargs)
+                restart_nfs_service(self.mgr, cluster_id)
+                return ["QOS bandwidth control has been successfully enabled. If the qos_type is changed during this process, ensure that the bandwidth values for all exports are updated accordingly."]
+            raise ClusterNotFound()
+        except NotImplementedError:
+            raise ManualRestartRequired("NFS-Ganesha QOS bandwidth control config added Successfully")
+        except Exception as e:
+            log.exception(f"Setting NFS-Ganesha QOS bandwidth control config failed for {cluster_id}")
+            raise ErrorResponse.wrap(e)
+
+    def get_nfs_cluster_qos(self, cluster_id: str) -> Dict[str, Any]:
+        try:
+            if cluster_id in available_clusters(self.mgr):
+                qos_obj = self.get_cluster_qos_config(cluster_id)
+                return qos_obj.to_dict() if qos_obj else {}
+            raise ClusterNotFound()
+        except Exception as e:
+            log.exception(f"Fetching NFS-Ganesha QOS bandwidth control config failed for {cluster_id}")
+            raise ErrorResponse.wrap(e)
+
+    def disable_nfs_cluster_qos(self, cluster_id: str) -> list[str]:
+        try:
+            if cluster_id in available_clusters(self.mgr):
+                self.update_cluster_qos(cluster_id, False, False, False)
+                restart_nfs_service(self.mgr, cluster_id)
+                return ["Cluster-level QoS bandwidth control has been successfully disabled. As a result, export-level bandwidth control will no longer have any effect, even if it's enabled."]
+            raise ClusterNotFound()
+        except NotImplementedError:
+            raise ManualRestartRequired("NFS-Ganesha QOS bandwidth control config Added Successfully")
+        except Exception as e:
+            log.exception(f"Setting NFS-Ganesha QOS bandwidth control config failed for {cluster_id}")
+            raise ErrorResponse.wrap(e)

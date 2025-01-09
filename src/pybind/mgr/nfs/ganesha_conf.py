@@ -1,8 +1,10 @@
 from typing import cast, List, Dict, Any, Optional, TYPE_CHECKING
 from os.path import isabs
+from enum import Enum
 
 from mgr_module import NFS_GANESHA_SUPPORTED_FSALS
 
+from ceph.utils import bytes_to_human, with_units_to_int
 from .exception import NFSInvalidOperation, FSNotFound
 from .utils import check_fs
 
@@ -322,6 +324,178 @@ class RGWFSAL(FSAL):
         return r
 
 
+class QOSParams(Enum):
+    clust_block = "QOS_DEFAULT_CONFIG"
+    export_block = "QOS_BLOCK"
+    enable_qos = "enable_qos"
+    enable_bw_ctrl = "enable_bw_control"
+    combined_bw_ctrl = "combined_rw_bw_control"
+    qos_type = "qos_type"
+    export_writebw = "max_export_write_bw"
+    export_readbw = "max_export_read_bw"
+    client_writebw = "max_client_write_bw"
+    client_readbw = "max_client_read_bw"
+    export_rw_bw = "max_export_combined_bw"
+    client_rw_bw = "max_client_combined_bw"
+
+
+class QOSType(Enum):
+    _1 = 'PerShare'
+    _2 = 'PerClient'
+    _3 = 'PerShare_PerClient'
+
+
+def _validate_qos_bw(bandwidth: str) -> int:
+    min_bw = 1000000  # 1MB
+    max_bw = 2000000000  # 2GB
+    bw_bytes = with_units_to_int(bandwidth)
+    if bw_bytes != 0 and (bw_bytes < min_bw or bw_bytes > max_bw):
+        raise Exception(f"Provided bandwidth value is not in range, Please enter a value between {min_bw} and {max_bw} bytes")
+    return bw_bytes
+
+
+class QOS(object):
+    def __init__(self,
+                 cluster_op: bool = False,
+                 enable_qos: bool = False,
+                 enable_bw_ctrl: bool = False,
+                 combined_bw_ctrl: bool = False,
+                 qos_type: Optional[QOSType] = None,
+                 export_writebw: str = '0',
+                 export_readbw: str = '0',
+                 client_writebw: str = '0',
+                 client_readbw: str = '0',
+                 export_rw_bw: str = '0',
+                 client_rw_bw: str = '0'
+                 ) -> None:
+        self.cluster_op = cluster_op
+        self.enable_qos = enable_qos
+        self.enable_bw_ctrl = enable_bw_ctrl
+        self.qos_type = qos_type
+        self.combined_bw_ctrl = combined_bw_ctrl
+        try:
+            self.export_writebw: int = _validate_qos_bw(export_writebw)
+            self.export_readbw: int = _validate_qos_bw(export_readbw)
+            self.client_writebw: int = _validate_qos_bw(client_writebw)
+            self.client_readbw: int = _validate_qos_bw(client_readbw)
+            self.export_rw_bw: int = _validate_qos_bw(export_rw_bw)
+            self.client_rw_bw: int = _validate_qos_bw(client_rw_bw)
+        except Exception as e:
+            raise Exception(f"Invalid bandwidth value. {e}")
+
+    @classmethod
+    def from_dict(cls, qos_dict: Dict[str, Any], cluster_op: bool = False) -> 'QOS':
+        kwargs: dict[str, Any] = {}
+        # qos dict will have qos type as enum value(str) and bandwidths in human redable format(str)
+        if cluster_op:
+            qos_type = qos_dict.get(QOSParams.qos_type.value)
+            if qos_type:
+                kwargs['qos_type'] = QOSType(qos_type)
+        kwargs.update(
+            {
+                'enable_qos': qos_dict.get(QOSParams.enable_qos.value),
+                'enable_bw_ctrl': qos_dict.get(QOSParams.enable_bw_ctrl.value),
+                'combined_bw_ctrl': qos_dict.get(QOSParams.combined_bw_ctrl.value),
+                'export_writebw': qos_dict.get(QOSParams.export_writebw.value, 0),
+                'export_readbw': qos_dict.get(QOSParams.export_readbw.value, 0),
+                'client_writebw': qos_dict.get(QOSParams.client_writebw.value, 0),
+                'client_readbw': qos_dict.get(QOSParams.client_readbw.value, 0),
+                'export_rw_bw': qos_dict.get(QOSParams.export_rw_bw.value, 0),
+                'client_rw_bw': qos_dict.get(QOSParams.client_rw_bw.value, 0)
+            }
+        )
+        return cls(cluster_op, **kwargs)
+
+    @classmethod
+    def from_qos_block(cls, qos_block: RawBlock, cluster_op: bool = False) -> 'QOS':
+        kwargs: dict[str, Any] = {}
+        # qos block will have qos type as enum name without underscore(int) and bandwidths in bytes(int)
+        if cluster_op:
+            qos_type = qos_block.values.get(QOSParams.qos_type.value)
+            if qos_type:
+                kwargs['qos_type'] = QOSType[f"_{qos_type}"]
+        kwargs.update(
+            {
+                'enable_qos': qos_block.values.get(QOSParams.enable_qos.value),
+                'enable_bw_ctrl': qos_block.values.get(QOSParams.enable_bw_ctrl.value),
+                'combined_bw_ctrl': qos_block.values.get(QOSParams.combined_bw_ctrl.value),
+                'export_writebw': str(qos_block.values.get(QOSParams.export_writebw.value, 0)),
+                'export_readbw': str(qos_block.values.get(QOSParams.export_readbw.value, 0)),
+                'client_writebw': str(qos_block.values.get(QOSParams.client_writebw.value, 0)),
+                'client_readbw': str(qos_block.values.get(QOSParams.client_readbw.value, 0)),
+                'export_rw_bw': str(qos_block.values.get(QOSParams.export_rw_bw.value, 0)),
+                'client_rw_bw': str(qos_block.values.get(QOSParams.client_rw_bw.value, 0))
+            }
+        )
+        return cls(cluster_op, **kwargs)
+
+    def to_qos_block(self) -> RawBlock:
+        if self.cluster_op:
+            result = RawBlock(QOSParams.clust_block.value)
+        else:
+            result = RawBlock(QOSParams.export_block.value)
+        # qos block will have qos type as enum name without underscore(int) and bandwidths in bytes(int)
+        result.values[QOSParams.enable_qos.value] = self.enable_qos
+        result.values[QOSParams.enable_bw_ctrl.value] = self.enable_bw_ctrl
+        result.values[QOSParams.combined_bw_ctrl.value] = self.combined_bw_ctrl
+        if self.cluster_op:
+            if self.qos_type:
+                result.values[QOSParams.qos_type.value] = int(self.qos_type.name[1])
+        if self.export_writebw:
+            result.values[QOSParams.export_writebw.value] = self.export_writebw
+        if self.export_readbw:
+            result.values[QOSParams.export_readbw.value] = self.export_readbw
+        if self.client_writebw:
+            result.values[QOSParams.client_writebw.value] = self.client_writebw
+        if self.client_readbw:
+            result.values[QOSParams.client_readbw.value] = self.client_readbw
+        if self.export_rw_bw:
+            result.values[QOSParams.export_rw_bw.value] = self.export_rw_bw
+        if self.client_rw_bw:
+            result.values[QOSParams.client_rw_bw.value] = self.client_rw_bw
+        return result
+
+    def to_dict(self) -> Dict[str, Any]:
+        r: Dict[str, Any] = {}
+        # qos dict will have qos type as enum value(str) and bandwidths in human redable format(str)
+        r[QOSParams.enable_qos.value] = self.enable_qos
+        r[QOSParams.enable_bw_ctrl.value] = self.enable_bw_ctrl
+        r[QOSParams.combined_bw_ctrl.value] = self.combined_bw_ctrl
+        if self.cluster_op:
+            if self.qos_type:
+                r[QOSParams.qos_type.value] = self.qos_type.value
+        if self.export_writebw:
+            r[QOSParams.export_writebw.value] = bytes_to_human(self.export_writebw)
+        if self.export_readbw:
+            r[QOSParams.export_readbw.value] = bytes_to_human(self.export_readbw)
+        if self.client_writebw:
+            r[QOSParams.client_writebw.value] = bytes_to_human(self.client_writebw)
+        if self.client_readbw:
+            r[QOSParams.client_readbw.value] = bytes_to_human(self.client_readbw)
+        if self.export_rw_bw:
+            r[QOSParams.export_rw_bw.value] = bytes_to_human(self.export_rw_bw)
+        if self.client_rw_bw:
+            r[QOSParams.client_rw_bw.value] = bytes_to_human(self.client_rw_bw)
+        return r
+
+    def update_bandwidths(self,
+                          export_writebw: str,
+                          export_readbw: str,
+                          client_writebw: str,
+                          client_readbw: str,
+                          export_rw_bw: str,
+                          client_rw_bw: str) -> None:
+        try:
+            self.export_writebw = _validate_qos_bw(export_writebw)
+            self.export_readbw = _validate_qos_bw(export_readbw)
+            self.client_writebw = _validate_qos_bw(client_writebw)
+            self.client_readbw = _validate_qos_bw(client_readbw)
+            self.export_rw_bw = _validate_qos_bw(export_rw_bw)
+            self.client_rw_bw = _validate_qos_bw(client_rw_bw)
+        except Exception as e:
+            raise Exception(f"Invalid bandwidth value. {e}")
+
+
 class Client:
     def __init__(self,
                  addresses: List[str],
@@ -375,7 +549,8 @@ class Export:
             transports: List[str],
             fsal: FSAL,
             clients: Optional[List[Client]] = None,
-            sectype: Optional[List[str]] = None) -> None:
+            sectype: Optional[List[str]] = None,
+            qos_block: Optional[QOS] = None) -> None:
         self.export_id = export_id
         self.path = path
         self.fsal = fsal
@@ -389,6 +564,7 @@ class Export:
         self.transports = transports
         self.clients: List[Client] = clients or []
         self.sectype = sectype
+        self.qos_block = qos_block
 
     @classmethod
     def from_export_block(cls, export_block: RawBlock, cluster_id: str) -> 'Export':
@@ -397,6 +573,10 @@ class Export:
 
         client_blocks = [b for b in export_block.blocks
                          if b.block_name == "CLIENT"]
+
+        qos_block = [b for b in export_block.blocks
+                     if b.block_name == "qos_block"]
+        qos_block = QOS.from_qos_block(qos_block[0]) if qos_block else None
 
         protocols = export_block.values.get('protocols')
         if not isinstance(protocols, list):
@@ -425,7 +605,9 @@ class Export:
                    FSAL.from_fsal_block(fsal_blocks[0]),
                    [Client.from_client_block(client)
                     for client in client_blocks],
-                   sectype=sectype)
+                   sectype=sectype,
+                   qos_block=qos_block
+                   )
 
     def to_export_block(self) -> RawBlock:
         values = {
@@ -448,10 +630,16 @@ class Export:
             client.to_client_block()
             for client in self.clients
         ]
+        if self.qos_block:
+            result.blocks.append(self.qos_block.to_qos_block())
         return result
 
     @classmethod
     def from_dict(cls, export_id: int, ex_dict: Dict[str, Any]) -> 'Export':
+        if ex_dict.get('qos_block'):
+            qos_block = QOS.from_dict(ex_dict.get('qos_block', {}))
+        else:
+            qos_block = None
         return cls(export_id,
                    ex_dict.get('path', '/'),
                    ex_dict['cluster_id'],
@@ -463,7 +651,9 @@ class Export:
                    ex_dict.get('transports', ['TCP']),
                    FSAL.from_dict(ex_dict.get('fsal', {})),
                    [Client.from_dict(client) for client in ex_dict.get('clients', [])],
-                   sectype=ex_dict.get("sectype"))
+                   sectype=ex_dict.get("sectype"),
+                   qos_block=qos_block
+                   )
 
     def to_dict(self) -> Dict[str, Any]:
         values = {
@@ -481,6 +671,8 @@ class Export:
         }
         if self.sectype:
             values['sectype'] = self.sectype
+        if self.qos_block:
+            values['qos_block'] = self.qos_block.to_dict()
         return values
 
     def validate(self, mgr: 'Module') -> None:
@@ -558,3 +750,28 @@ def format_block(block: RawBlock, depth: int = 0) -> str:
     conf_str += _indentation(depth)
     conf_str += "}\n"
     return conf_str
+
+
+QOS_REQ_PARAMS = {
+    'combined_bw_disabled': {
+        'PerShare': ['max_export_write_bw', 'max_export_read_bw'],
+        'PerClient': ['max_client_write_bw', 'max_client_read_bw'],
+        'PerShare_PerClient': ['max_export_write_bw', 'max_export_read_bw', 'max_client_write_bw', 'max_client_read_bw']
+    },
+    'combined_bw_enabled': {
+        'PerShare': ['max_export_combined_bw'],
+        'PerClient': ['max_client_combined_bw'],
+        'PerShare_PerClient': ['max_export_combined_bw', 'max_client_combined_bw'],
+    }
+}
+
+
+def qos_bandwidth_checks(qos_type: QOSType, combined_bw_ctrl: bool, **kwargs: Any) -> None:
+    """Checks for enabling qos"""
+    if not combined_bw_ctrl:
+        req_params = QOS_REQ_PARAMS['combined_bw_disabled'][qos_type.value]
+    else:
+        req_params = QOS_REQ_PARAMS['combined_bw_enabled'][qos_type.value]
+    if any((key in req_params and kwargs[key] == '0')
+           or (key not in req_params and kwargs[key] != '0') for key in kwargs):
+        raise Exception(f"When combined_rw_bw is {'enabled' if combined_bw_ctrl else 'disabled'} and qos_type is {qos_type.value}, only the following parameters are required: {','.join(req_params)}.")
