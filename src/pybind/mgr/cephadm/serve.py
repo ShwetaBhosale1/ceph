@@ -303,11 +303,13 @@ class CephadmServe:
 
             if self.mgr.cache.host_needs_registry_login(host) and self.mgr.get_store('registry_credentials'):
                 self.log.debug(f"Logging `{host}` into custom registry")
-                with self.mgr.async_timeout_handler(host, 'cephadm registry-login'):
-                    r = self.mgr.wait_async(self._registry_login(
-                        host, json.loads(str(self.mgr.get_store('registry_credentials')))))
-                if r:
-                    bad_hosts.append(r)
+                try:
+                    with self.mgr.async_timeout_handler(host, 'cephadm registry-login'):
+                        self.mgr.wait_async(self._registry_login(
+                            host, json.loads(str(self.mgr.get_store('registry_credentials')))))
+                except OrchestratorError as e:
+                    self.log.exception(f"Failed to perform 'cephadm registry-login' on {host}")
+                    bad_hosts.append(str(e))
 
             if self.mgr.cache.host_needs_osdspec_preview_refresh(host):
                 self.log.debug(f"refreshing OSDSpec previews for {host}")
