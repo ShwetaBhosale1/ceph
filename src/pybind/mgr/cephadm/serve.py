@@ -1882,11 +1882,14 @@ class CephadmServe:
                 to_remove.append(service_name)
                 continue
             spec = self.mgr.spec_store[service_name].spec
-            rank_map = self.mgr.spec_store[spec.service_name()].rank_map or {}
+            rank_map = self.mgr.spec_store[service_name].rank_map or {}
             daemons = self.mgr.cache.get_daemons_by_service(service_name)
             svc = service_registry.get_service('nfs')
             self.log.debug(f'Retry NFS fence old rank for {service_name} service')
-            svc.fence_old_ranks(spec, rank_map, len(daemons))
+            try:
+                svc.fence_old_ranks(spec, rank_map, len(daemons))
+            except Exception as e:
+                self.log.exception(f'Failed to retry fence old ranks for {service_name}: {e}')
         if to_remove:
             self.log.debug(f'Remove NFS service from retry fence old ranks as services {to_remove} are removed')
             failed_services = self.mgr.get_store('nfs_fencing_failed_services')

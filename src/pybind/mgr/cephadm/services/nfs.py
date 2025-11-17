@@ -65,7 +65,9 @@ class NFSService(CephService):
                     del rank_map[rank]
                     self.mgr.spec_store.save_rank_map(service_name, rank_map)
                 except RuntimeError:
-                    self.mgr.log.exception('Got exception while removing node id from grace table')
+                    self.mgr.log.exception(
+                        f'Failed to remove node id {nodeid} (rank {rank}) from grace table for service {service_name}'
+                    )
                     fence_failed = True
             else:
                 max_gen = max(m.keys())
@@ -83,7 +85,7 @@ class NFSService(CephService):
         elif service_name in services:
             services.remove(service_name)
         val = ','.join(services) if services else None
-        if failed_services or services:
+        if failed_services != val:
             self.mgr.set_store('nfs_fencing_failed_services', val)
 
     def config(self, spec: NFSServiceSpec) -> None:  # type: ignore
@@ -345,7 +347,7 @@ class NFSService(CephService):
                 if action == 'remove' and 'Failure: -126' in stderr:
                     self.mgr.log.info(
                         f'Ignore ganesha-rados-grace tool remove failure as {nodeid} does not '
-                        f'exists for {spec.service_name()} service'
+                        f'exist for {spec.service_name()} service'
                     )
                     return
 
