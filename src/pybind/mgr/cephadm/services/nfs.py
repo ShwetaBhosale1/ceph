@@ -125,6 +125,7 @@ class NFSService(CephService):
 
         port = daemon_spec.ports[0] if daemon_spec.ports else 2049
         monitoring_ip, monitoring_port = self.get_monitoring_details(daemon_spec.service_name, host)
+        daemon_spec.ports.append(monitoring_port)
 
         # create the RGW keyring
         rgw_user = f'{rados_user}-rgw'
