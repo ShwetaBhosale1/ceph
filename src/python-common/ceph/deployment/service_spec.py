@@ -1338,6 +1338,7 @@ class NFSServiceSpec(ServiceSpec):
                  idmap_conf: Optional[Dict[str, Dict[str, str]]] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
                  cluster_qos_config: Optional[Dict[str, Union[str, bool, int]]] = None,
+                 cluster_qos_port: Optional[int] = None,
                  ssl: bool = False,
                  ssl_cert: Optional[str] = None,
                  ssl_key: Optional[str] = None,
@@ -1373,6 +1374,7 @@ class NFSServiceSpec(ServiceSpec):
         self.idmap_conf = idmap_conf
         self.enable_nlm = enable_nlm
         self.cluster_qos_config = cluster_qos_config
+        self.cluster_qos_port = cluster_qos_port
 
         # TLS fields
         self.tls_ciphers = tls_ciphers

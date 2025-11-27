@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class NFSService(CephService):
     TYPE = 'nfs'
     DEFAULT_EXPORTER_PORT = 9587
+    DEFAULT_CLUSTER_QOS_PORT = 18189
 
     @property
     def needs_monitoring(self) -> bool:
@@ -124,6 +125,9 @@ class NFSService(CephService):
         port = daemon_spec.ports[0] if daemon_spec.ports else 2049
         monitoring_ip, monitoring_port = self.get_monitoring_details(daemon_spec.service_name, host)
 
+        cluster_qos_port = spec.cluster_qos_port if spec.cluster_qos_port else self.DEFAULT_CLUSTER_QOS_PORT
+        daemon_spec.ports.append(cluster_qos_port)
+
         # create the RGW keyring
         rgw_user = f'{rados_user}-rgw'
         rgw_keyring = self.create_rgw_keyring(daemon_spec)
@@ -164,6 +168,7 @@ class NFSService(CephService):
                 "port": port,
                 "monitoring_addr": monitoring_ip,
                 "monitoring_port": monitoring_port,
+                "cqos_port": spec.cluster_qos_port,
                 "bind_addr": bind_addr,
                 "haproxy_hosts": [],
                 "nfs_idmap_conf": nfs_idmap_conf,
