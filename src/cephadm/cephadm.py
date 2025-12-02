@@ -3330,6 +3330,46 @@ def command_logs(ctx: CephadmContext) -> None:
 ##################################
 
 
+def command_exec(ctx: CephadmContext) -> int:
+    """
+    Execute a shell command on the host
+    Return Codes:
+        - `0`: Command executed successfully
+        - `124`: Command timed out
+        - `1`: Error during execution
+        - Other: Return code from the executed command
+    """
+    if not ctx.command:
+        raise Error('No command provided to execute')
+
+    cmd = ctx.command
+    logger.debug('Executing command: %s' % ' '.join(cmd))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=os.environ.copy(),
+            timeout=ctx.timeout
+        )
+
+        # Print stdout and stderr
+        if result.stdout:
+            sys.stdout.write(result.stdout.decode('utf-8', errors='replace'))
+        if result.stderr:
+            sys.stderr.write(result.stderr.decode('utf-8', errors='replace'))
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        logger.error('Command timed out after %s seconds' % ctx.timeout)
+        return 124
+    except Exception as e:
+        logger.error('Error executing command: %s' % str(e))
+        return 1
+
+##################################
+
+
 def command_list_networks(ctx):
     # type: (CephadmContext) -> None
     r = list_networks(ctx)
@@ -4938,6 +4978,16 @@ def _get_parser():
     parser_logs.add_argument(
         'command', nargs='*',
         help='additional journalctl args')
+
+    parser_exec = subparsers.add_parser(
+        'exec', help='execute a shell command on the host')
+    parser_exec.set_defaults(func=command_exec)
+    parser_exec.add_argument(
+        '--command', nargs=argparse.REMAINDER,
+        help='command to execute')
+    parser_exec.add_argument(
+        '--fsid',
+        help='cluster FSID')
 
     parser_bootstrap = subparsers.add_parser(
         'bootstrap', help='bootstrap a cluster (mon + mgr daemons)')
