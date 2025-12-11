@@ -231,17 +231,17 @@ class SSHManager:
                                addr: Optional[str] = None,
                                log_command: Optional[bool] = True,
                                ) -> Tuple[str, str, int]:
-        
+
         # If SSH hardening is enabled, wrap command through invoker
         # The invoker is an executable script (#!/usr/bin/env python3) so we call it directly
         if self.mgr.limited_ssh and self.mgr.invoker_binary_path:
             # Skip wrapping if already wrapped (avoid double-wrapping)
             already_wrapped = any(self.mgr.invoker_binary_path in str(part) for part in list(cmd_components))
-            
+
             if not already_wrapped:
                 # Check if command contains cephadm binary path
                 has_cephadm = any(self.mgr.cephadm_binary_path in str(part) for part in list(cmd_components))
-                
+
                 if has_cephadm:
                     # Cephadm command: Prepend invoker to the entire command
                     # python3 cephadm.{hash} <args> -> invoker.py python3 cephadm.{hash} <args>
@@ -339,6 +339,43 @@ class SSHManager:
         with self.mgr.async_timeout_handler(host, " ".join(cmd)):
             return self.mgr.wait_async(self._check_execute_command(host, cmd, stdin, addr, log_command))
 
+    async def _execute_command_via_cephadm(self,
+                                           host: str,
+                                           cmd: RemoteCommand,
+                                           addr: Optional[str] = None,
+                                           error_ok: Optional[bool] = False,
+                                           ) -> Tuple[str, str, int]:
+        """
+        Execute a shell command via cephadm exec for SSH hardening.
+        This wraps direct shell commands to be executed through cephadm.
+        """
+        from . import serve
+
+        # Convert RemoteCommand to a list for cephadm exec
+        cmd_list = list(cmd)
+        # Use CephadmServe to execute via cephadm exec
+        cephadm_serve = serve.CephadmServe(self.mgr)
+        return await cephadm_serve._run_cephadm_shell_command(
+            host, cmd_list, addr=addr, error_ok=error_ok
+        )
+
+    async def _check_execute_command_via_cephadm(self,
+                                                 host: str,
+                                                 cmd: RemoteCommand,
+                                                 addr: Optional[str] = None,
+                                                 ) -> str:
+        """
+        Execute a shell command via cephadm exec and raise exception on failure.
+        """
+        out, err, code = await self._execute_command_via_cephadm(
+            host, cmd, addr=addr, error_ok=False
+        )
+        if code != 0:
+            msg = f'Command {cmd} failed. {err}'
+            logger.debug(msg)
+            raise OrchestratorError(msg)
+        return out
+
     async def _write_remote_file(self,
                                  host: str,
                                  path: str,
@@ -347,26 +384,48 @@ class SSHManager:
                                  uid: Optional[int] = None,
                                  gid: Optional[int] = None,
                                  addr: Optional[str] = None,
+                                 use_cephadm_exec: Optional[bool] = True,
                                  ) -> None:
         try:
+            # Determine execution method:
+            # - True: use cephadm exec (default for normal operations)
+            # - False: use direct SSH (for bootstrap/binary deployment)
+            # Note: We removed auto-detection to avoid extra 'ls' command on every call
+            # Callers should explicitly pass False during binary deployment
+
             cephadm_tmp_dir = f"/tmp/cephadm-{self.mgr._cluster_fsid}"
             dirname = os.path.dirname(path)
             mkdir = RemoteCommand(Executables.MKDIR, ['-p', dirname])
-            await self._check_execute_command(host, mkdir, addr=addr)
+            if use_cephadm_exec:
+                await self._check_execute_command_via_cephadm(host, mkdir, addr=addr)
+            else:
+                await self._check_execute_command(host, mkdir, addr=addr)
             mkdir2 = RemoteCommand(Executables.MKDIR, ['-p', cephadm_tmp_dir + dirname])
-            await self._check_execute_command(host, mkdir2, addr=addr)
+            if use_cephadm_exec:
+                await self._check_execute_command_via_cephadm(host, mkdir2, addr=addr)
+            else:
+                await self._check_execute_command(host, mkdir2, addr=addr)
             tmp_path = cephadm_tmp_dir + path + '.new'
             touch = RemoteCommand(Executables.TOUCH, [tmp_path])
-            await self._check_execute_command(host, touch, addr=addr)
+            if use_cephadm_exec:
+                await self._check_execute_command_via_cephadm(host, touch, addr=addr)
+            else:
+                await self._check_execute_command(host, touch, addr=addr)
             if self.mgr.ssh_user != 'root':
                 assert self.mgr.ssh_user
                 chown = RemoteCommand(
                     Executables.CHOWN,
                     ['-R', self.mgr.ssh_user, cephadm_tmp_dir]
                 )
-                await self._check_execute_command(host, chown, addr=addr)
+                if use_cephadm_exec:
+                    await self._check_execute_command_via_cephadm(host, chown, addr=addr)
+                else:
+                    await self._check_execute_command(host, chown, addr=addr)
                 chmod = RemoteCommand(Executables.CHMOD, [str(644), tmp_path])
-                await self._check_execute_command(host, chmod, addr=addr)
+                if use_cephadm_exec:
+                    await self._check_execute_command_via_cephadm(host, chmod, addr=addr)
+                else:
+                    await self._check_execute_command(host, chmod, addr=addr)
             with NamedTemporaryFile(prefix='cephadm-write-remote-file-') as f:
                 os.fchmod(f.fileno(), 0o600)
                 f.write(content)
@@ -380,11 +439,20 @@ class SSHManager:
                     Executables.CHOWN,
                     ['-R', str(uid) + ':' + str(gid), tmp_path]
                 )
-                await self._check_execute_command(host, chown, addr=addr)
+                if use_cephadm_exec:
+                    await self._check_execute_command_via_cephadm(host, chown, addr=addr)
+                else:
+                    await self._check_execute_command(host, chown, addr=addr)
                 chmod = RemoteCommand(Executables.CHMOD, [oct(mode)[2:], tmp_path])
-                await self._check_execute_command(host, chmod, addr=addr)
+                if use_cephadm_exec:
+                    await self._check_execute_command_via_cephadm(host, chmod, addr=addr)
+                else:
+                    await self._check_execute_command(host, chmod, addr=addr)
             mv = RemoteCommand(Executables.MV, ['-Z', tmp_path, path])
-            await self._check_execute_command(host, mv, addr=addr)
+            if use_cephadm_exec:
+                await self._check_execute_command_via_cephadm(host, mv, addr=addr)
+            else:
+                await self._check_execute_command(host, mv, addr=addr)
         except Exception as e:
             msg = f"Unable to write {host}:{path}: {e}"
             logger.exception(msg)
@@ -398,10 +466,11 @@ class SSHManager:
                           uid: Optional[int] = None,
                           gid: Optional[int] = None,
                           addr: Optional[str] = None,
+                          use_cephadm_exec: Optional[bool] = True,
                           ) -> None:
         with self.mgr.async_timeout_handler(host, f'writing file {path}'):
             self.mgr.wait_async(self._write_remote_file(
-                host, path, content, mode, uid, gid, addr))
+                host, path, content, mode, uid, gid, addr, use_cephadm_exec))
 
     async def _reset_con(self, host: str) -> None:
         conn = self.cons.get(host)

@@ -1367,7 +1367,7 @@ class CephadmServe:
                 continue
             self.log.info(f'Removing {host}:{path}')
             cmd = ssh.RemoteCommand(ssh.Executables.RM, ['-f', path])
-            self.mgr.ssh.check_execute_command(host, cmd)
+            self.mgr.wait_async(self.mgr.ssh._check_execute_command_via_cephadm(host, cmd))
             updated_files = True
             self.mgr.cache.removed_client_file(host, path)
         if updated_files:
@@ -1761,7 +1761,7 @@ class CephadmServe:
             # N.B. because the python3 executable is based on the results of the
             # which command we can not know it ahead of time and must be converted
             # into a RemoteExecutable.
-            
+
             # Build the cephadm command
             # SSH hardening (invoker wrapping) is handled at the _execute_command level
             cmd = ssh.RemoteCommand(
@@ -1868,9 +1868,46 @@ class CephadmServe:
 
     async def _deploy_cephadm_binary(self, host: str, addr: Optional[str] = None) -> None:
         # Use tee (from coreutils) to create a copy of cephadm on the target machine
+        # Note: use_cephadm_exec=False because we're deploying the binary (bootstrap scenario)
+        # This avoids an extra 'ls' command to check if binary exists
         self.log.info(f"Deploying cephadm binary to {host}")
         await self.mgr.ssh._write_remote_file(host, self.mgr.cephadm_binary_path,
-                                              self.mgr._cephadm, addr=addr)
+                                              self.mgr._cephadm, addr=addr,
+                                              use_cephadm_exec=False)
+
+    async def _run_cephadm_shell_command(self,
+                                         host: str,
+                                         cmd: List[str],
+                                         addr: Optional[str] = "",
+                                         error_ok: Optional[bool] = False,
+                                         ) -> Tuple[str, str, int]:
+        """
+        Execute a shell command on the remote host through cephadm exec.
+        This wraps bash commands to be executed through cephadm for SSH hardening.
+
+        :param host: The host to execute the command on
+        :param cmd: The command and arguments as a list (e.g., ['mkdir', '-p', '/path'])
+        :param addr: Optional address override
+        :param error_ok: If True, don't raise an exception on command failure
+        :return: Tuple of (stdout, stderr, return_code)
+        """
+        # Use cephadm exec to execute the command
+        # The exec command takes --command followed by the command to execute
+        # Format: cephadm exec --command <cmd> [args...] --fsid <fsid>
+        args = ['--command'] + cmd
+        out, err, code = await self._run_cephadm(
+            host,
+            cephadmNoImage,
+            'exec',
+            args,
+            addr=addr,
+            error_ok=error_ok,
+            no_fsid=False
+        )
+        # Join output list into string for compatibility
+        out_str = ''.join(out) if isinstance(out, list) else out
+        err_str = ''.join(err) if isinstance(err, list) else err
+        return out_str, err_str, code
 
 
 def _host_selector(svc: Any) -> Optional[HostSelector]:
