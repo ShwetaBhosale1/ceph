@@ -41,7 +41,7 @@ class OfflineHostWatcher(threading.Thread):
         if host not in self.mgr.offline_hosts:
             try:
                 rcmd = ssh.RemoteCommand(ssh.Executables.TRUE)
-                self.mgr.ssh.check_execute_command(host, rcmd, log_command=self.mgr.log_refresh_metadata)
+                self.mgr.wait_async(self.mgr.ssh._check_execute_command_via_cephadm(host, rcmd))
             except Exception:
                 logger.debug(f'OfflineHostDetector: detected {host} to be offline')
                 # kick serve loop in case corrective action must be taken for offline host
