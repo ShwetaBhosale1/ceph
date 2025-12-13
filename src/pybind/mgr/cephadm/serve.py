@@ -1761,6 +1761,9 @@ class CephadmServe:
             # N.B. because the python3 executable is based on the results of the
             # which command we can not know it ahead of time and must be converted
             # into a RemoteExecutable.
+            
+            # Build the cephadm command
+            # SSH hardening (invoker wrapping) is handled at the _execute_command level
             cmd = ssh.RemoteCommand(
                 ssh.RemoteExecutable(python),
                 [self.mgr.cephadm_binary_path] + final_args
