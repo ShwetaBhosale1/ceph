@@ -505,6 +505,14 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             default='169.254.1.1',
             desc="Default IP address for RedFish API (OOB management)."
         ),
+        Option(
+            'ssh_hardening',
+            type='bool',
+            default=False,
+            desc='Enable SSH hardening by routing all command execution through invoker.py. '
+                 'When enabled, cephadm and bash commands are validated and executed via '
+                 'the secure invoker wrapper.'
+        ),
     ]
     for image in DefaultImages:
         MODULE_OPTIONS.append(Option(image.key, default=image.image_ref, desc=image.desc))
@@ -610,6 +618,9 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.oob_default_addr = ''
             self.ssh_keepalive_interval = 0
             self.ssh_keepalive_count_max = 0
+            self.ssh_hardening = False
+            self.invoker_binary_path = ''
+            self.cephadm_binary_path = ''
             self.certificate_duration_days = 0
             self.certificate_renewal_threshold_days = 0
             self.certificate_automated_rotation_enabled = False
@@ -629,6 +640,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                 path, str(e)))
 
         self.cephadm_binary_path = self._get_cephadm_binary_path()
+
+        # Path to invoker.py script for SSH hardening
+        # The invoker script is installed on each host at /usr/libexec/cephadm/invoker.py
+        self.invoker_binary_path = '/usr/libexec/cephadm/invoker.py'
 
         self._worker_pool = multiprocessing.pool.ThreadPool(10)
 

@@ -259,6 +259,39 @@ class SSHManager:
                                addr: Optional[str] = None,
                                log_command: Optional[bool] = True,
                                ) -> Tuple[str, str, int]:
+
+        # If SSH hardening is enabled, wrap command through invoker
+        # The invoker is an executable script (#!/usr/bin/env python3) so we call it directly
+        invoker_path = self.mgr.invoker_binary_path
+        if self.mgr.ssh_hardening and invoker_path:
+            cephadm_path = self.mgr.cephadm_binary_path
+            already_wrapped = False
+            has_cephadm = False
+
+            for part in cmd_components:
+                part_str = str(part)
+                if invoker_path in part_str:
+                    already_wrapped = True
+                    break  # No need to continue if already wrapped
+                if cephadm_path in part_str:
+                    has_cephadm = True
+
+            if not already_wrapped:
+                if has_cephadm:
+                    # Cephadm command: Prepend invoker to the entire command
+                    # python3 cephadm.{hash} <args> -> invoker.py python3 cephadm.{hash} <args>
+                    cmd_components = RemoteCommand(
+                        RemoteExecutable(invoker_path),
+                        [str(cmd_components.exe)] + list(cmd_components.args)
+                    )
+                else:
+                    # Shell command: Execute as invoker.py --exec <command> [args...]
+                    # mkdir -p /path -> invoker.py --exec mkdir -p /path
+                    cmd_components = RemoteCommand(
+                        RemoteExecutable(invoker_path),
+                        ['--exec'] + list(cmd_components)
+                    )
+
         conn = await self._remote_connection(host, addr)
 
         # For hosts being added, always use root (no sudo) even if cluster
