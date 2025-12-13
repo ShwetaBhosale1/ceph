@@ -231,6 +231,31 @@ class SSHManager:
                                addr: Optional[str] = None,
                                log_command: Optional[bool] = True,
                                ) -> Tuple[str, str, int]:
+        
+        # If SSH hardening is enabled, wrap command through invoker
+        # The invoker is an executable script (#!/usr/bin/env python3) so we call it directly
+        if self.mgr.limited_ssh and self.mgr.invoker_binary_path:
+            # Skip wrapping if already wrapped (avoid double-wrapping)
+            already_wrapped = any(self.mgr.invoker_binary_path in str(part) for part in list(cmd_components))
+            
+            if not already_wrapped:
+                # Check if command contains cephadm binary path
+                has_cephadm = any(self.mgr.cephadm_binary_path in str(part) for part in list(cmd_components))
+                
+                if has_cephadm:
+                    # Cephadm command: Prepend invoker to the entire command
+                    # python3 cephadm.{hash} <args> -> invoker.py python3 cephadm.{hash} <args>
+                    cmd_components = RemoteCommand(
+                        RemoteExecutable(self.mgr.invoker_binary_path),
+                        [str(cmd_components.exe)] + list(cmd_components.args)
+                    )
+                else:
+                    # Shell command: Execute as invoker.py --exec <command> [args...]
+                    # mkdir -p /path -> invoker.py --exec mkdir -p /path
+                    cmd_components = RemoteCommand(
+                        RemoteExecutable(self.mgr.invoker_binary_path),
+                        ['--exec'] + list(cmd_components)
+                    )
 
         conn = await self._remote_connection(host, addr)
         use_sudo = (self.mgr.ssh_user != 'root')
