@@ -546,6 +546,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.stray_daemon_check_interval = 0
             self.max_count_per_host = 0
             self.mode = ''
+            self.limited_ssh = False
+            self.invoker_binary_path = ''
             self.container_image_base = ''
             self.container_image_prometheus = ''
             self.container_image_nvmeof = ''
@@ -1462,6 +1464,36 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                 if item.startswith('host %s ' % host):
                     self.event.set()
         return 0, '%s (%s) ok' % (host, addr), '\n'.join(err)
+
+    @orchestrator._cli_write_command(
+        'cephadm prepare-host-limited-sudo')
+    def _prepare_host_limited_sudo(
+        self,
+        username: str,
+        host: str,
+        addr: Optional[str] = None
+    ) -> Tuple[int, str, str]:
+        """
+        Configure limited sudo access for SSH hardening.
+        Grants the specified user permission to execute only the invoker
+        script with sudo.
+        """
+        with self.async_timeout_handler(
+            host, 'cephadm prepare-host-limited-sudo'
+        ):
+            out, err, code = self.wait_async(
+                CephadmServe(self)._run_cephadm(
+                    host, cephadmNoImage, 'prepare-host-limited-sudo',
+                    ['--username', username],
+                    addr=addr, error_ok=True, no_fsid=True))
+        if code:
+            return 1, '', (
+                'prepare-host-limited-sudo failed:\n' + '\n'.join(err)
+            )
+        return 0, (
+            f'Successfully configured limited sudo for '
+            f'{username} on {host}'
+        ), '\n'.join(out)
 
     @orchestrator._cli_write_command(
         prefix='cephadm set-extra-ceph-conf')

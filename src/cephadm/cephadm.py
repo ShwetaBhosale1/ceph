@@ -4266,6 +4266,80 @@ def command_prepare_host(ctx: CephadmContext) -> None:
     logger.info('Repeating the final host check...')
     command_check_host(ctx)
 
+
+def command_prepare_host_limited_sudo(ctx: CephadmContext) -> None:
+    """
+    Configure sudoers to allow limited sudo access for SSH hardening.
+    Creates a sudoers file that grants the specified user permission to execute
+    only the invoker script with sudo privileges.
+
+    Args:
+        ctx: CephadmContext with username attribute
+    """
+    if not ctx.username:
+        raise Error('must specify --username')
+
+    username = ctx.username
+    invoker_path = '/usr/libexec/cephadm/invoker.py'
+    sudoers_file = f'/etc/sudoers.d/cephadm-{username}-limited'
+
+    logger.info(f'Configuring limited sudo access for user {username}...')
+
+    # Verify the invoker script exists
+    if not os.path.exists(invoker_path):
+        raise Error(
+            f'Invoker script not found at {invoker_path}. '
+            f'Please ensure the invoker is installed before '
+            f'running this command.'
+        )
+
+    # Create sudoers entry
+    # Format: username ALL=(ALL) NOPASSWD: /usr/libexec/cephadm/invoker.py
+    sudoers_content = '# Created by cephadm for SSH hardening\n'
+    sudoers_content += (
+        f'# Allow {username} to execute invoker script with sudo\n'
+    )
+    sudoers_content += (
+        f'{username} ALL=(ALL) NOPASSWD: {invoker_path}\n'
+    )
+
+    # Write to temporary file first to validate syntax
+    import tempfile
+    tmp_file = tempfile.NamedTemporaryFile(
+        mode='w', delete=False, prefix='sudoers-'
+    )
+    tmp_file.write(sudoers_content)
+    tmp_file.close()
+    tmp_file_path = tmp_file.name
+
+    try:
+        # Validate sudoers syntax using visudo
+        logger.info('Validating sudoers syntax...')
+        out, err, code = call(ctx, ['visudo', '-c', '-f', tmp_file_path])
+        if code != 0:
+            raise Error(f'Invalid sudoers syntax: {err}')
+
+        # Write sudoers file with proper permissions using write_new
+        logger.info(f'Installing sudoers file: {sudoers_file}')
+        with write_new(
+            sudoers_file,
+            owner=(0, 0),  # root:root
+            perms=0o440,
+        ) as f:
+            f.write(sudoers_content)
+
+        logger.info(
+            f'Successfully configured limited sudo access '
+            f'for user {username}'
+        )
+        logger.info(
+            f'User {username} can now execute: sudo {invoker_path}'
+        )
+
+    finally:
+        # Clean up temporary file using cephadmlib utility
+        unlink_file(tmp_file_path, missing_ok=True)
+
 ##################################
 
 
@@ -5230,6 +5304,15 @@ def _get_parser():
     parser_prepare_host.add_argument(
         '--expect-hostname',
         help='Set hostname')
+
+    parser_prepare_host_limited_sudo = subparsers.add_parser(
+        'prepare-host-limited-sudo',
+        help='configure limited sudo access for SSH hardening')
+    parser_prepare_host_limited_sudo.set_defaults(func=command_prepare_host_limited_sudo)
+    parser_prepare_host_limited_sudo.add_argument(
+        '--username',
+        required=True,
+        help='Username to grant limited sudo access to invoker script')
 
     parser_add_repo = subparsers.add_parser(
         'add-repo', help='configure package repository')
