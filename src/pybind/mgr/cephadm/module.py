@@ -1170,6 +1170,86 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
 
         return True, err, ret
 
+    def _setup_user_on_host(self, host: str, user: str, ssh_pub_key: str,
+                            addr: Optional[str] = None) -> None:
+        """
+        Setup sudoers and copy SSH key by calling cephadm setup-ssh-user command.
+        User must already exist on the host.
+        For root user, only SSH key is copied (sudoers setup is skipped).
+        """
+        self.log.info(f'Setting up user {user} on {host}...')
+        try:
+            out, err, code = self.wait_async(
+                CephadmServe(self)._run_cephadm(
+                    host,
+                    cephadmNoImage,
+                    'setup-ssh-user',
+                    ['--ssh-user', user, '--ssh-pub-key', ssh_pub_key],
+                    addr=addr,
+                    error_ok=False,
+                    no_fsid=True
+                )
+            )
+            if code != 0:
+                raise OrchestratorError(
+                    f'Failed to setup user {user} on {host}: {err}'
+                )
+            self.log.info(f'Successfully set up user {user} on {host}')
+        except Exception as e:
+            self.log.exception(f'Failed to setup user {user} on {host}: {e}')
+            raise OrchestratorError(f'Failed to setup user {user} on {host}: {e}')
+
+    def _setup_user_on_all_hosts(self, user: str) -> None:
+        """
+        Setup sudoers and copy SSH key. This must be run as root user.
+        For root user, only SSH key is copied (sudoers setup is skipped).
+        """
+        # Get SSH public key
+        if not self.ssh_pub:
+            raise OrchestratorError(
+                'No SSH public key configured. '
+                'Please generate or set SSH keys first using '
+                '`ceph cephadm generate-key` or `ceph cephadm set-pub-key`.'
+            )
+        hosts = self.cache.get_hosts()
+        if not hosts:
+            self.log.warning('No hosts in inventory, skipping user setup')
+            return
+        self.log.info(f'Setting up user {user} on {len(hosts)} host(s)...')
+
+        @forall_hosts
+        def setup_user_on_host(host: str) -> Tuple[str, Optional[str]]:
+            """Returns (host, error_message) tuple. error_message is None on success."""
+            try:
+                assert self.ssh_pub
+                self._setup_user_on_host(host, user, self.ssh_pub)
+                return (host, None)
+            except Exception as e:
+                self.log.error(f'Failed to setup user {user} on {host}: {e}')
+                return (host, str(e))
+
+        results = setup_user_on_host(hosts)
+        failed_hosts = [(host, error) for host, error in results if error is not None]
+        if failed_hosts:
+            error_parts = [f'Failed to setup user {user} on the following hosts:']
+            for host, error in failed_hosts:
+                error_parts.append(f'  - {host}: {error}')
+            error_parts.extend([
+                f'\nPlease ensure user {user} exists on these hosts and retry:',
+                f'  1. Create user: useradd -m -s /bin/bash {user}',
+                f'  2. Retry: ceph cephadm set-user {user}',
+                '\nOr manually complete the setup:',
+                f'  1. Setup sudoers: echo "{user} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/{user}',
+                f'  2. Set permissions: chmod 440 /etc/sudoers.d/{user}',
+                '  3. Copy SSH key: ceph cephadm get-pub-key > ~/ceph.pub',
+                f'  4. Add key: ssh-copy-id -f -i ~/ceph.pub {user}@HOST',
+                '\nOr use --skip-pre-steps flag to skip automatic setup.'
+            ])
+            error_msg = '\n'.join(error_parts)
+            raise OrchestratorError(error_msg)
+
+        self.log.info(f'Successfully set up user {user} on all {len(hosts)} host(s)')
+
     def _validate_and_set_ssh_val(self, what: str, new: Optional[str], old: Optional[str]) -> None:
         self.set_store(what, new)
         self.ssh._reconfig_ssh()
@@ -1331,15 +1411,34 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         else:
             return 0, self.ssh_user, ''
 
-    @orchestrator._cli_read_command(
+    @orchestrator._cli_write_command(
         'cephadm set-user')
-    def set_ssh_user(self, user: str) -> Tuple[int, str, str]:
+    def set_ssh_user(self, user: str, skip_pre_steps: bool = False) -> Tuple[int, str, str]:
         """
-        Set user for SSHing to cluster hosts, passwordless sudo will be needed for non-root users
+        Set user for SSHing to cluster hosts, passwordless sudo will be needed for non-root users.
+
+        This command will automatically setup passwordless sudo for the user and
+        copy SSH public key to the user's authorized_keys
+        Use --skip-pre-steps if you have already manually configured the user on all hosts.
         """
         current_user = self.ssh_user
         if user == current_user:
             return 0, "value unchanged", ""
+
+        if user != 'root' and not skip_pre_steps:
+            if current_user != 'root':
+                return -errno.EINVAL, '', (
+                    f'Cannot setup user {user} while using non-root user {current_user}. '
+                    f'Please switch back to root first using `ceph cephadm set-user root`, '
+                    f'or use --skip-pre-steps if user {user} is already configured on all hosts.'
+                )
+
+            try:
+                self._setup_user_on_all_hosts(user)
+            except OrchestratorError as e:
+                return -errno.EINVAL, '', str(e)
+            except Exception as e:
+                return -errno.EINVAL, '', f'Failed to setup user {user} on all hosts: {e}'
 
         self._validate_and_set_ssh_val('ssh_user', user, current_user)
         current_ssh_config = self._get_ssh_config()
@@ -1919,6 +2018,7 @@ Then run the following:
             self.update_maintenance_healthcheck()
         self.event.set()  # refresh stray health check
         self.log.info('Added host %s' % spec.hostname)
+
         return "Added host '{}' with addr '{}'".format(spec.hostname, spec.addr)
 
     @handle_orch_error

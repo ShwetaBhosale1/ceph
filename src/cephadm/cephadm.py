@@ -4461,6 +4461,26 @@ def change_maintenance_mode(ctx: CephadmContext) -> str:
                     return f'success - systemd target {target} enabled and started'
         return f'success - systemd target {target} enabled and started'
 
+
+def command_setup_ssh_user(ctx: CephadmContext) -> int:
+    """
+    Setup SSH user on the local host by configuring passwordless sudo and
+    copying SSH public key to user's authorized_keys.
+    This command must be run as root.
+    """
+    from cephadmlib.user_utils import setup_ssh_user
+
+    user = ctx.ssh_user
+    ssh_pub_key = ctx.ssh_pub_key
+
+    if not user:
+        raise Error('--ssh-user is required')
+    if not ssh_pub_key:
+        raise Error('--ssh-pub-key is required')
+
+    setup_ssh_user(ctx, user, ssh_pub_key)
+    return 0
+
 ##################################
 
 
@@ -5180,6 +5200,18 @@ def _get_parser():
     parser_prepare_host.add_argument(
         '--expect-hostname',
         help='Set hostname')
+
+    parser_setup_ssh_user = subparsers.add_parser(
+        'setup-ssh-user', help='setup SSH user with passwordless sudo and SSH key')
+    parser_setup_ssh_user.set_defaults(func=command_setup_ssh_user)
+    parser_setup_ssh_user.add_argument(
+        '--ssh-user',
+        required=True,
+        help='SSH user to setup')
+    parser_setup_ssh_user.add_argument(
+        '--ssh-pub-key',
+        required=True,
+        help='SSH public key to add to user authorized_keys')
 
     parser_add_repo = subparsers.add_parser(
         'add-repo', help='configure package repository')
