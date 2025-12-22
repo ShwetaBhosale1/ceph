@@ -145,20 +145,47 @@ class SSHManager:
     def __init__(self, mgr: "CephadmOrchestrator"):
         self.mgr: "CephadmOrchestrator" = mgr
         self.cons: Dict[str, "SSHClientConnection"] = {}
+        self.con_users: Dict[str, str] = {}  # Track which user each connection is for
 
     async def _remote_connection(self,
                                  host: str,
                                  addr: Optional[str] = None,
                                  ) -> "SSHClientConnection":
-        if not self.cons.get(host) or host not in self.mgr.inventory:
+        # Determine which user we should connect as
+        is_host_being_added = host in self.mgr.hosts_being_added
+        expected_user = 'root' if is_host_being_added else self.mgr.ssh_user
+
+        # Check if we need to create a new connection
+        # Create new if: no cached connection, host not in inventory, or cached connection is for wrong user
+        existing_conn = self.cons.get(host)
+        cached_user = self.con_users.get(host)
+        need_new_connection = (
+            not existing_conn
+            or host not in self.mgr.inventory
+            or cached_user != expected_user
+        )
+
+        if need_new_connection:
+            # Close existing connection if it's for the wrong user
+            if existing_conn and cached_user and cached_user != expected_user:
+                logger.info(f"Closing connection to {host} (user changed from {cached_user} to {expected_user})")
+                await self._reset_con(host)
+
             if not addr and host in self.mgr.inventory:
                 addr = self.mgr.inventory.get_addr(host)
 
             if not addr:
                 raise OrchestratorError("host address is empty")
 
-            assert self.mgr.ssh_user
-            n = self.mgr.ssh_user + '@' + addr
+            # For hosts being added, use root user even if cluster is configured
+            # to use non-root user. This allows initial setup operations.
+            ssh_user = expected_user
+
+            if is_host_being_added:
+                logger.info(f"Connecting to {host} as root (host being added)")
+
+            assert ssh_user
+            n = ssh_user + '@' + addr
             logger.debug("Opening connection to {} with ssh options '{}'".format(
                 n, self.mgr._ssh_options))
 
@@ -171,7 +198,7 @@ class SSHManager:
                         keepalive_interval=self.mgr.ssh_keepalive_interval,
                         keepalive_count_max=self.mgr.ssh_keepalive_count_max
                     )
-                    conn = await asyncssh.connect(addr, username=self.mgr.ssh_user, client_keys=[self.mgr.tkey.name],
+                    conn = await asyncssh.connect(addr, username=ssh_user, client_keys=[self.mgr.tkey.name],
                                                   known_hosts=None, config=[self.mgr.ssh_config_fname],
                                                   preferred_auth=['publickey'], options=ssh_options)
                 except OSError:
@@ -181,6 +208,7 @@ class SSHManager:
                 except Exception:
                     raise
             self.cons[host] = conn
+            self.con_users[host] = ssh_user  # Track which user this connection is for
 
         self.mgr.offline_hosts_remove(host)
 
@@ -233,7 +261,15 @@ class SSHManager:
                                ) -> Tuple[str, str, int]:
 
         conn = await self._remote_connection(host, addr)
-        use_sudo = (self.mgr.ssh_user != 'root')
+
+        # For hosts being added, always use root (no sudo) even if cluster
+        # is configured to use non-root user. This allows initial setup.
+        is_host_being_added = host in self.mgr.hosts_being_added
+        use_sudo = (self.mgr.ssh_user != 'root') and not is_host_being_added
+
+        if is_host_being_added:
+            logger.debug(f'Host {host} is being added, using root user without sudo')
+
         rcmd = RemoteSudoCommand.wrap(cmd_components, use_sudo=use_sudo)
         try:
             address = addr or self.mgr.inventory.get_addr(host)
@@ -384,6 +420,9 @@ class SSHManager:
             logger.debug(f'_reset_con close {host}')
             conn.close()
             del self.cons[host]
+        # Also remove user tracking
+        if host in self.con_users:
+            del self.con_users[host]
 
     def reset_con(self, host: str) -> None:
         with self.mgr.async_timeout_handler(cmd=f'resetting ssh connection to {host}'):
@@ -394,6 +433,7 @@ class SSHManager:
             logger.debug(f'_reset_cons close {host}')
             conn.close()
         self.cons = {}
+        self.con_users = {}  # Also clear user tracking
 
     def _reconfig_ssh(self) -> None:
         temp_files = []  # type: list
