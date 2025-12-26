@@ -4522,6 +4522,74 @@ def command_setup_ssh_user(ctx: CephadmContext) -> int:
 ##################################
 
 
+def command_prepare_host_ssh_hardening(ctx: CephadmContext) -> int:
+    """
+    Prepare host for SSH hardening by:
+    1. Authorizing SSH public key for the user
+    2. Installing/upgrading cephadm RPM to match cluster version (includes invoker.py)
+    3. Setting up sudoers with restricted permissions for invoker.py
+    This command must be run as root.
+    """
+    from cephadmlib.user_utils import (
+        validate_user_exists,
+        setup_sudoers_restricted,
+        install_or_upgrade_cephadm
+    )
+    from cephadmlib.ssh import authorize_ssh_key
+
+    logger.info('Preparing host for SSH hardening...')
+
+    # Verify we're running as root
+    if os.geteuid() != 0:
+        raise Error('This operation must be run as root')
+
+    user = ctx.ssh_user if hasattr(ctx, 'ssh_user') and ctx.ssh_user else 'root'
+    ssh_pub_key = ctx.ssh_pub_key if hasattr(ctx, 'ssh_pub_key') else None
+    cephadm_version = ctx.cephadm_version if hasattr(ctx, 'cephadm_version') else None
+
+    has_failures = False
+    # Step 1: Authorize SSH public key for the user
+    if ssh_pub_key:
+        try:
+            logger.debug('Authorizing SSH key for user %s', user)
+            authorize_ssh_key(ssh_pub_key, user)
+        except Exception as e:
+            logger.exception('Failed to authorize SSH key for %s. err: %s', user, e)
+            has_failures = True
+    else:
+        logger.warning('SSH key authorization skipped (no key provided)')
+
+    # Step 2: Install/upgrade cephadm RPM (includes invoker.py)
+    success, message = install_or_upgrade_cephadm(ctx, cephadm_version)
+    if success:
+        logger.debug('Installed cephadm RPM: %s', message)
+    else:
+        logger.error('Failed to install cephadm RPM: %s', message)
+        has_failures = True
+
+    # Step 3: Setup sudoers with restricted permissions for invoker.py
+    if user and user != 'root':
+        try:
+            validate_user_exists(user)
+            setup_sudoers_restricted(ctx, user, '/usr/libexec/cephadm/invoker.py')
+            logger.debug('Sudoers configured for %s (restricted to invoker.py)', user)
+        except Exception as e:
+            logger.exception('Failed to setup sudoers for %s. err: %s', user, e)
+            has_failures = True
+    else:
+        logger.debug('Sudoers setup skipped (root user)')
+
+    logger.info('Host preparation completed')
+
+    # Raise error if any step failed
+    if has_failures:
+        raise Error('Host preparation failed')
+
+    return 0
+
+##################################
+
+
 class ArgumentFacade:
     def __init__(self) -> None:
         self.defaults: Dict[str, Any] = {}
@@ -5260,6 +5328,20 @@ def _get_parser():
         '--ssh-pub-key',
         required=True,
         help='SSH public key to add to user authorized_keys')
+
+    parser_prepare_host_ssh_hardening = subparsers.add_parser(
+        'prepare-host-ssh-hardening',
+        help='prepare host for SSH hardening by installing cephadm, configuring sudoers, and enabling SSH hardening')
+    parser_prepare_host_ssh_hardening.set_defaults(func=command_prepare_host_ssh_hardening)
+    parser_prepare_host_ssh_hardening.add_argument(
+        '--ssh-user',
+        help='SSH user to configure (default: root)')
+    parser_prepare_host_ssh_hardening.add_argument(
+        '--ssh-pub-key',
+        help='SSH public key to authorize for the user')
+    parser_prepare_host_ssh_hardening.add_argument(
+        '--cephadm-version',
+        help='Specific cephadm version to install')
 
     parser_add_repo = subparsers.add_parser(
         'add-repo', help='configure package repository')

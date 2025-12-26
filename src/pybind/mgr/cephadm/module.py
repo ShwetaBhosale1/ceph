@@ -1569,6 +1569,207 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                     self.event.set()
         return 0, '%s (%s) ok' % (host, addr), '\n'.join(err)
 
+    def _prepare_single_host_for_ssh_hardening(
+        self,
+        host: str,
+        user: str,
+        ssh_pub_key: str,
+        cephadm_args: List[str]
+    ) -> Tuple[str, bool, str, List[str]]:
+        """
+        Prepare a single host for SSH hardening.
+        This function is designed to be called in parallel for multiple hosts.
+        Returns:
+            Tuple of (hostname, success, error_message, output_lines)
+        """
+        try:
+            self.log.info(f'Preparing host {host} for SSH hardening...')
+            addr = self.inventory.get_addr(host) if host in self.inventory else None
+
+            # Execute the cephadm command on the remote host
+            with self.async_timeout_handler(host, 'cephadm prepare-host-ssh-hardening'):
+                out, err, code = self.wait_async(
+                    CephadmServe(self)._run_cephadm(
+                        host, cephadmNoImage, 'prepare-host-ssh-hardening', cephadm_args,
+                        addr=addr, error_ok=True, no_fsid=True))
+            if code:
+                error_msg = '\n'.join(err) if err else 'Unknown error'
+                self.log.error(f'Failed to prepare host {host}: {error_msg}')
+                return (host, False, error_msg, [])
+            else:
+                self.log.info(f'Successfully prepared host {host}')
+                return (host, True, '', out if out else [])
+        except Exception as e:
+            error_msg = str(e)
+            self.log.exception(f'Exception while preparing host {host}: {error_msg}')
+            return (host, False, error_msg, [])
+
+    @forall_hosts
+    def _prepare_hosts_for_ssh_hardening_parallel(
+        self,
+        host: str,
+        user: str,
+        ssh_pub_key: str,
+        cephadm_args: List[str]
+    ) -> Tuple[str, bool, str, List[str]]:
+        """
+        Parallel wrapper for preparing hosts.
+        This function is decorated with @forall_hosts for parallelization.
+        """
+        return self._prepare_single_host_for_ssh_hardening(host, user, ssh_pub_key, cephadm_args)
+
+    @orchestrator._cli_write_command(
+        'cephadm prepare-host-and-enable-ssh-hardening')
+    def _prepare_host_and_enable_ssh_hardening(
+        self,
+        user: str,
+        host_label: Optional[str] = None
+    ) -> Tuple[int, str, str]:
+        """
+        Prepare hosts and enable SSH hardening for the cluster.
+        This command performs a complete SSH hardening setup:
+        1. Prepare each host for SSH hardening (install cephadm, configure sudoers) - executed on all hosts
+        2. Set SSH user to the specified user for cluster operations (without pre-steps) - manager operation
+        3. Enable SSH hardening globally for the cluster - manager operation
+
+        Args:
+            user: SSH user for the cluster operations. This user will be configured on all hosts
+                 and set as the cluster-wide SSH user. REQUIRED parameter.
+            host_label: Optional label to identify specific hosts (e.g., 'ssh_hardening', 'secure').
+                       If not provided, all hosts in the cluster will be prepared.
+        """
+        results = []
+
+        # Validate SSH key is configured
+        if not self.ssh_pub:
+            return 1, '', 'Error: No SSH public key configured. Run "ceph cephadm generate-key" first.'
+
+        # Get hosts based on label or all hosts
+        if host_label:
+            hosts_to_prepare = [h for h in self.cache.get_hosts()
+                                if self.inventory.has_label(h, host_label)]
+            if not hosts_to_prepare:
+                return 1, '', f'Error: No hosts found with label "{host_label}". Use "ceph orch host label add <host> {host_label}" first.'
+            self.log.info(f'Found {len(hosts_to_prepare)} host(s) with label "{host_label}": {", ".join(hosts_to_prepare)}')
+            results.append(f'Preparing {len(hosts_to_prepare)} host(s) with label "{host_label}": {", ".join(hosts_to_prepare)}')
+        else:
+            hosts_to_prepare = self.cache.get_hosts()
+            if not hosts_to_prepare:
+                return 1, '', 'Error: No hosts found in the cluster.'
+            self.log.info(f'Preparing all {len(hosts_to_prepare)} host(s) in the cluster: {", ".join(hosts_to_prepare)}')
+            results.append(f'Preparing all {len(hosts_to_prepare)} host(s) in the cluster: {", ".join(hosts_to_prepare)}')
+
+        results.append('')
+
+        # Prepare arguments for the cephadm command
+        args = []
+        args.extend(['--ssh-user', user])
+        args.extend(['--ssh-pub-key', self.ssh_pub])
+
+        try:
+            # self.version format: "ceph version 18.2.0 (...)"
+            version_info = self.version
+            if version_info:
+                parts = version_info.split()
+                if len(parts) > 2 and parts[0] == 'ceph' and parts[1] == 'version':
+                    ceph_version = parts[2]
+                    args.extend(['--cephadm-version', ceph_version])
+                    self.log.info(f'Will install cephadm version {ceph_version} to match cluster')
+        except Exception as e:
+            self.log.warning(f'Could not determine cluster version: {e}')
+
+        # Step 1: Prepare each host for SSH hardening (executed on all target hosts in parallel)
+        self.log.info(f'Step 1: Preparing {len(hosts_to_prepare)} host(s) for SSH hardening in parallel...')
+
+        # Prepare arguments for parallel execution
+        # The @forall_hosts decorator expects a list of tuples with arguments for each host
+        host_args = [(host, user, self.ssh_pub, args) for host in hosts_to_prepare]
+
+        try:
+            host_results = self._prepare_hosts_for_ssh_hardening_parallel(host_args)
+        except Exception as e:
+            self.log.exception(f'Failed to prepare hosts in parallel: {e}')
+            return 1, '', f'Failed to prepare hosts: {str(e)}'
+
+        failed_hosts = []
+        for hostname, success, error_msg, output_lines in host_results:
+            if success:
+                results.append(f'✓ Host {hostname}: Prepared successfully')
+                if output_lines:
+                    for line in output_lines:
+                        results.append(f'  {line}')
+            else:
+                results.append(f'✗ Host {hostname}: Failed - {error_msg}')
+                failed_hosts.append(hostname)
+
+        if failed_hosts:
+            results.append('')
+            results.append(f'Failed to prepare {len(failed_hosts)} host(s): {", ".join(failed_hosts)}')
+            return 1, '', '\n'.join(results)
+
+        results.append('')
+        results.append(f'✓ Step 1: All {len(hosts_to_prepare)} host(s) prepared successfully')
+        label_info = f'with label "{host_label}"' if host_label else 'in the cluster'
+        self.log.info(f'All hosts {label_info} prepared successfully')
+
+        # Step 2: Set SSH user for cluster operations (manager operation)
+        self.log.info(f'Step 2: Setting SSH user to {user} for cluster operations (manager operation)...')
+
+        try:
+            # Call set_ssh_user with skip_pre_steps=True since we've already prepared the hosts
+            current_user = self.ssh_user
+            if current_user != user:
+                retval, out_msg, err_msg = self.set_ssh_user(user, skip_pre_steps=True)
+                if retval == 0:
+                    results.append(f'✓ Step 2: SSH user set to {user} for cluster operations')
+                    self.log.info(f'SSH user set to {user}')
+                else:
+                    error_msg = err_msg if err_msg else out_msg
+                    results.append(f'✗ Step 2: Failed to set SSH user: {error_msg}')
+                    return 1, '', '\n'.join(results)
+            else:
+                results.append(f'✓ Step 2: SSH user already set to {user}')
+                self.log.info(f'SSH user already set to {user}')
+        except Exception as e:
+            error_msg = f'Failed to set SSH user: {e}'
+            self.log.exception(error_msg)
+            results.append(f'✗ Step 2: {error_msg}')
+            return 1, '', '\n'.join(results)
+
+        # Step 3: Enable SSH hardening globally (manager operation)
+        self.log.info('Step 3: Enabling SSH hardening globally (manager operation)...')
+
+        try:
+            if self.ssh_hardening:
+                results.append('✓ Step 3: SSH hardening already enabled')
+                self.log.info('SSH hardening is already enabled')
+            else:
+                self.set_module_option('ssh_hardening', True)
+                self.ssh_hardening = True
+                results.append('✓ Step 3: SSH hardening enabled globally')
+                self.log.info('SSH hardening has been enabled globally')
+        except Exception as e:
+            error_msg = f'Failed to enable SSH hardening: {e}'
+            self.log.exception(error_msg)
+            results.append(f'✗ Step 3: {error_msg}')
+            return 1, '', '\n'.join(results)
+
+        summary = '\n'.join(results)
+        if host_label:
+            title = f'Successfully configured SSH hardening for hosts with label "{host_label}"'
+        else:
+            title = 'Successfully configured SSH hardening for all hosts in the cluster'
+
+        success_msg = (
+            f'{title}\n'
+            f'{summary}\n'
+            f'SSH hardening is now active for all cluster operations.\n'
+            f'Affected hosts: {", ".join(hosts_to_prepare)}\n'
+        )
+
+        self.log.info(f'SSH hardening setup complete for {len(hosts_to_prepare)} host(s)')
+        return 0, success_msg, ''
+
     @orchestrator._cli_write_command(
         prefix='cephadm set-extra-ceph-conf')
     def _set_extra_ceph_conf(self, inbuf: Optional[str] = None) -> HandleCommandResult:
