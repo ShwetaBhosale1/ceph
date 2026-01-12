@@ -577,10 +577,28 @@ class Task(object):
         self.lock = threading.Lock()
 
     def __hash__(self):
-        return hash((self.name, tuple(sorted(self.metadata.items()))))
+        hashable_metadata = self._get_hashable_metadata()
+        return hash((self.name, tuple(sorted(hashable_metadata.items()))))
 
     def __eq__(self, other):
-        return self.name == other.name and self.metadata == other.metadata
+        if self.name != other.name:
+            return False
+        # Compare metadata, handling unhashable values
+        self_hashable = self._get_hashable_metadata()
+        other_hashable = other._get_hashable_metadata()
+        return self_hashable == other_hashable
+
+    def _get_hashable_metadata(self):
+        """Get metadata in hashable format."""
+        hashable_metadata = {}
+        for k, v in self.metadata.items():
+            try:
+                hash(v)  # Test if value is hashable
+                hashable_metadata[k] = v
+            except TypeError:
+                # Convert unhashable values to their string representation
+                hashable_metadata[k] = str(v)
+        return hashable_metadata
 
     def __str__(self):
         return "Task(ns={}, md={})" \

@@ -12,25 +12,26 @@ import logging
 import time
 import uuid
 import concurrent.futures
-from functools import partial
+from datetime import datetime, timezone
+from functools import partial, wraps
+
+import cherrypy
 from threading import Lock
+from queue import Queue
 from typing import Any, Dict, List, Optional
 
-import yaml  # type: ignore
-
 from .. import mgr
-from ..exceptions import DashboardException
 from ..security import Scope
 from ..services.cephfs import CephFS as CephFSService
 from ..services.exception import serialize_dashboard_exception
 from ..services.orchestrator import OrchClient
+from ..tools import TaskManager
 from . import (
     APIDoc,
     APIRouter,
     CreatePermission,
     Endpoint,
     EndpointDoc,
-    ReadPermission,
     RESTController,
     Task,
 )
@@ -103,7 +104,47 @@ BATCH_PROVISION_RESULT_SCHEMA = {
 
 def provision_task(name, metadata, wait_for=10.0):
     """Task decorator for provision operations."""
+    # If metadata is callable, call it to get dynamic metadata
+    if callable(metadata):
+        metadata = metadata()
+
     return Task(
+        "storage_provision/{}".format(name),
+        metadata,
+        wait_for,
+        partial(serialize_dashboard_exception, include_http_status=True)
+    )
+
+
+def provision_task_async(name, metadata, wait_for=0):
+    """Task decorator for async provision operations."""
+    # If metadata is callable, call it to get dynamic metadata
+    if callable(metadata):
+        metadata = metadata()
+
+    class AsyncTask(Task):
+        def __call__(self, func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                arg_map = self._gen_arg_map(func, args, kwargs)
+                metadata = self._get_metadata(arg_map)
+
+                # Generate unique task ID
+                unique_id = str(uuid.uuid4())
+                task_name = f"storage_provision/{name}/{unique_id}"
+
+                TaskManager.run(task_name, metadata, func, args, kwargs,
+                                exception_handler=self.exception_handler)
+                # Always return immediately with task info
+                cherrypy.response.status = 202
+                return {
+                    'task_id': task_name,
+                    'unique_id': unique_id,
+                    'message': 'Configuration started successfully'
+                }
+            return wrapper
+
+    return AsyncTask(
         "storage_provision/{}".format(name),
         metadata,
         wait_for,
@@ -199,104 +240,22 @@ class StorageProvision(RESTController):
     @Endpoint('POST', path='/nfs-cephfs')
     @CreatePermission
     @EndpointDoc(
-        "Provision NFS export over CephFS (synchronous)",
-        parameters={'config': (dict, 'Provision configuration')},
-        responses={200: PROVISION_RESULT_SCHEMA}
-    )
-    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
-    def provision_nfs_cephfs(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Provision NFS export over CephFS (synchronous).
-
-        Operations executed in sequence (skipping any not specified):
-        1. Apply NFS service specification
-        2. Create CephFS volume
-        3. Create subvolume groups
-        4. Create subvolumes
-        5. Wait for NFS service (if created and exports specified)
-        6. Create NFS exports
-
-        :param config: Configuration dictionary
-        :return: Dictionary with success status and operation results
-        """
-        result = self._execute_single_config(config)
-        return result.to_dict()
-
-    @Endpoint('POST', path='/nfs-cephfs/async')
-    @CreatePermission
-    @EndpointDoc(
-        "Provision NFS export over CephFS (async/background task)",
-        parameters={'config': (dict, 'Provision configuration')},
-        responses={
-            200: PROVISION_RESULT_SCHEMA,
-            202: {'name': (str, 'Task name'), 'metadata': (dict, 'Task info')}
-        }
-    )
-    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
-    @provision_task('nfs_cephfs', {}, wait_for=5.0)
-    def provision_nfs_cephfs_async(
-        self,
-        config: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Provision NFS export over CephFS as a background task.
-
-        Returns immediately with task info if operation takes > 5 seconds.
-        Check task status via GET /api/task?name=storage_provision/nfs_cephfs
-
-        :param config: Configuration dictionary
-        :return: Dictionary with success status and operation results
-        """
-        result = self._execute_single_config(config)
-        return result.to_dict()
-
-    @Endpoint('POST', path='/nfs-cephfs/batch')
-    @CreatePermission
-    @EndpointDoc(
-        "Provision multiple NFS/CephFS configurations (synchronous)",
-        parameters={
-            'configs': ([dict], 'List of provision configurations'),
-            'parallel': (bool, 'Execute in parallel (default: true)'),
-            'max_workers': (int, 'Max parallel workers (default: 4)')
-        },
-        responses={200: BATCH_PROVISION_RESULT_SCHEMA}
-    )
-    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
-    def provision_nfs_cephfs_batch(
-        self,
-        configs: List[Dict[str, Any]],
-        parallel: bool = True,
-        max_workers: int = 4
-    ) -> Dict[str, Any]:
-        """
-        Provision multiple NFS/CephFS configurations (synchronous).
-
-        Each configuration is executed independently. With parallel=True,
-        all configurations are processed concurrently using a thread pool.
-
-        :param configs: List of provision configurations
-        :param parallel: Execute configurations in parallel (default: True)
-        :param max_workers: Maximum number of parallel workers (default: 4)
-        :return: Dictionary with batch results
-        """
-        return self._execute_batch(configs, parallel, max_workers)
-
-    @Endpoint('POST', path='/nfs-cephfs/batch/async')
-    @CreatePermission
-    @EndpointDoc(
-        "Provision multiple NFS/CephFS configurations (async/background)",
+        "Provision NFS export over CephFS (batch async/background)",
         parameters={
             'configs': ([dict], 'List of provision configurations'),
             'parallel': (bool, 'Execute in parallel (default: true)'),
             'max_workers': (int, 'Max parallel workers (default: 4)')
         },
         responses={
-            200: BATCH_PROVISION_RESULT_SCHEMA,
-            202: {'name': (str, 'Task name'), 'metadata': (dict, 'Task info')}
+            202: {
+                'task_id': (str, 'Unique task identifier for querying status'),
+                'unique_id': (str, 'Unique ID component'),
+                'message': (str, 'Success message')
+            }
         }
     )
     @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
-    @provision_task('nfs_cephfs_batch', {}, wait_for=5.0)
+    @provision_task_async('nfs_cephfs', {'subtasks': []})
     def provision_nfs_cephfs_batch_async(
         self,
         configs: List[Dict[str, Any]],
@@ -306,15 +265,110 @@ class StorageProvision(RESTController):
         """
         Provision multiple NFS/CephFS configurations as background task.
 
-        Returns immediately with task info if operation takes > 5 seconds.
-        Check status: GET /api/task?name=storage_provision/nfs_cephfs_batch
+        Returns immediately with unique task ID and success message.
+        Check status: GET /api/task?name={task_id}
 
         :param configs: List of provision configurations
         :param parallel: Execute configurations in parallel (default: True)
         :param max_workers: Maximum number of parallel workers (default: 4)
-        :return: Dictionary with batch results
+        :return: Dictionary with task_id and message
         """
         return self._execute_batch(configs, parallel, max_workers)
+
+    @Endpoint('POST', path='/rgw')
+    @CreatePermission
+    @EndpointDoc(
+        "Provision RGW (Object Gateway) service - PLACEHOLDER",
+        parameters={
+            'configs': ([dict], 'List of RGW provision configurations'),
+        },
+        responses={
+            501: {'error': (str, 'Not implemented')}
+        }
+    )
+    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
+    def provision_rgw(self, configs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Provision RGW (Object Gateway) service configurations.
+
+        PLACEHOLDER - Not implemented yet.
+
+        :param configs: List of RGW provision configurations
+        :return: Placeholder response
+        """
+        raise NotImplementedError("RGW provisioning not implemented yet")
+
+    @Endpoint('POST', path='/smb')
+    @CreatePermission
+    @EndpointDoc(
+        "Provision SMB/CIFS service - PLACEHOLDER",
+        parameters={
+            'configs': ([dict], 'List of SMB provision configurations'),
+        },
+        responses={
+            501: {'error': (str, 'Not implemented')}
+        }
+    )
+    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
+    def provision_smb(self, configs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Provision SMB/CIFS service configurations.
+
+        PLACEHOLDER - Not implemented yet.
+
+        :param configs: List of SMB provision configurations
+        :return: Placeholder response
+        """
+        raise NotImplementedError("SMB provisioning not implemented yet")
+
+    @Endpoint('POST', path='/rbd')
+    @CreatePermission
+    @EndpointDoc(
+        "Provision RBD (Block Device) service - PLACEHOLDER",
+        parameters={
+            'configs': ([dict], 'List of RBD provision configurations'),
+        },
+        responses={
+            501: {'error': (str, 'Not implemented')}
+        }
+    )
+    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
+    def provision_rbd(self, configs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Provision RBD (Block Device) service configurations.
+
+        PLACEHOLDER - Not implemented yet.
+
+        :param configs: List of RBD provision configurations
+        :return: Placeholder response
+        """
+        raise NotImplementedError("RBD provisioning not implemented yet")
+
+    @Endpoint('POST', path='/nfs-rgw')
+    @CreatePermission
+    @EndpointDoc(
+        "Provision NFS-RGW service - PLACEHOLDER",
+        parameters={
+            'configs': ([dict], 'List of NFS-RGW provision configurations'),
+        },
+        responses={
+            501: {'error': (str, 'Not implemented')}
+        }
+    )
+    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
+    def provision_nfs_rgw(
+        self,
+        configs: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Provision NFS-RGW service configurations.
+
+        PLACEHOLDER - Not implemented yet.
+
+        :param configs: List of NFS-RGW provision configurations
+        :return: Placeholder response
+        """
+        raise NotImplementedError("NFS-RGW provisioning not implemented yet")
 
     def _execute_batch(
         self,
@@ -339,6 +393,80 @@ class StorageProvision(RESTController):
                 'config_results': []
             }
 
+        # Initialize detailed subtasks for each operation type per config
+        task_begin_time = datetime.now(timezone.utc).isoformat()
+        subtasks = []
+        for idx, cfg in enumerate(configs):
+            config_name = self._get_config_name(cfg, idx)
+
+            # Add subtasks for each operation type in this config
+            if cfg.get('nfs_service'):
+                subtasks.append({
+                    'name': f'config_{idx}_nfs_service',
+                    'description': f'NFS service for {config_name}',
+                    'status': 'pending',
+                    'begin_time': task_begin_time,
+                    'config_id': idx,
+                    'operation': 'nfs_service'
+                })
+
+            if cfg.get('fs_volume'):
+                subtasks.append({
+                    'name': f'config_{idx}_fs_volume',
+                    'description': f'CephFS volume for {config_name}',
+                    'status': 'pending',
+                    'begin_time': task_begin_time,
+                    'config_id': idx,
+                    'operation': 'fs_volume'
+                })
+
+            if cfg.get('fs_subvolume_groups'):
+                for group_idx, group in enumerate(cfg['fs_subvolume_groups']):
+                    subtasks.append({
+                        'name': f'config_{idx}_subvol_group_{group_idx}',
+                        'description': 'Subvolume group {} for {}'.format(
+                            group["group_name"], config_name),
+                        'status': 'pending',
+                        'begin_time': task_begin_time,
+                        'config_id': idx,
+                        'operation': 'fs_subvolume_groups',
+                        'group_name': group['group_name']
+                    })
+
+            if cfg.get('fs_subvolumes'):
+                for subvol_idx, subvol in enumerate(cfg['fs_subvolumes']):
+                    subtasks.append({
+                        'name': f'config_{idx}_subvolume_{subvol_idx}',
+                        'description': f'Subvolume {subvol["sub_name"]} '
+                                       f'for {config_name}',
+                        'status': 'pending',
+                        'begin_time': task_begin_time,
+                        'config_id': idx,
+                        'operation': 'fs_subvolumes',
+                        'sub_name': subvol['sub_name']
+                    })
+
+            if cfg.get('nfs_exports'):
+                for export_idx, export in enumerate(cfg['nfs_exports']):
+                    subtasks.append({
+                        'name': f'config_{idx}_nfs_export_{export_idx}',
+                        'description': f'NFS export {export["pseudo_path"]} '
+                                       f'for {config_name}',
+                        'status': 'pending',
+                        'begin_time': task_begin_time,
+                        'config_id': idx,
+                        'operation': 'nfs_exports',
+                        'pseudo_path': export['pseudo_path']
+                    })
+
+        # Update the current task metadata with subtasks
+        current_task = TaskManager.current_task()
+        if current_task:
+            current_task.metadata['subtasks'] = subtasks
+
+        # Create a thread-safe queue for status updates
+        status_queue: Queue = Queue()
+
         config_results: List[Dict[str, Any]] = []
 
         if parallel and len(configs) > 1:
@@ -350,7 +478,9 @@ class StorageProvision(RESTController):
                 # Submit all configurations
                 future_to_idx = {
                     executor.submit(
-                        self._execute_single_config, cfg, idx
+                        self._execute_single_config, cfg, idx,
+                        lambda c_idx, op, st, item_idx=None: self._update_subtask_status(
+                            c_idx, op, st, item_idx, status_queue)
                     ): idx
                     for idx, cfg in enumerate(configs)
                 }
@@ -364,9 +494,10 @@ class StorageProvision(RESTController):
                         results_by_idx[idx] = result
                     except Exception as e:  # pylint: disable=broad-except
                         # Create error result for failed execution
+                        config_name = self._get_config_name(configs[idx], idx)
                         err_result = ProvisionResult(
                             config_id=str(idx),
-                            config_name='config_{}'.format(idx)
+                            config_name=config_name
                         )
                         err_result.add_failure(
                             'execution',
@@ -376,9 +507,37 @@ class StorageProvision(RESTController):
                             {'error': str(e)}
                         )
                         results_by_idx[idx] = err_result
+                        # Mark all subtasks for this config as failed
+                        config = configs[idx]
+                        operations = []
+                        if config.get('nfs_service'):
+                            operations.append(('nfs_service', None))
+                        if config.get('fs_volume'):
+                            operations.append(('fs_volume', None))
+                        if config.get('fs_subvolume_groups'):
+                            for i in range(len(config['fs_subvolume_groups'])):
+                                operations.append(('fs_subvolume_groups', i))
+                        if config.get('fs_subvolumes'):
+                            for i in range(len(config['fs_subvolumes'])):
+                                operations.append(('fs_subvolumes', i))
+                        if config.get('nfs_exports'):
+                            for i in range(len(config['nfs_exports'])):
+                                operations.append(('nfs_exports', i))
+
+                        timestamp = datetime.now(timezone.utc).isoformat()
+                        for op, idx_val in operations:
+                            status_queue.put({
+                                'config_idx': idx,
+                                'operation': op,
+                                'status': 'failed',
+                                'item_index': idx_val,
+                                'timestamp': timestamp
+                            })
                         logger.exception(
                             'Configuration %d execution failed', idx
                         )
+
+                # Status updates are now applied immediately, no need to process queue
 
                 # Sort results by original index
                 for idx in sorted(results_by_idx.keys()):
@@ -387,12 +546,17 @@ class StorageProvision(RESTController):
             # Execute configurations sequentially
             for idx, cfg in enumerate(configs):
                 try:
-                    result = self._execute_single_config(cfg, idx)
+                    result = self._execute_single_config(
+                        cfg, idx,
+                        lambda c_idx, op, st, item_idx=None: self._update_subtask_status(
+                            c_idx, op, st, item_idx, status_queue)
+                    )
                     config_results.append(result.to_batch_dict())
                 except Exception as e:  # pylint: disable=broad-except
+                    config_name = self._get_config_name(cfg, idx)
                     err_result = ProvisionResult(
                         config_id=str(idx),
-                        config_name='config_{}'.format(idx)
+                        config_name=config_name
                     )
                     err_result.add_failure(
                         'execution',
@@ -400,7 +564,34 @@ class StorageProvision(RESTController):
                         {'error': str(e)}
                     )
                     config_results.append(err_result.to_batch_dict())
+                    # Mark all subtasks for this config as failed
+                    operations = []
+                    if cfg.get('nfs_service'):
+                        operations.append(('nfs_service', None))
+                    if cfg.get('fs_volume'):
+                        operations.append(('fs_volume', None))
+                    if cfg.get('fs_subvolume_groups'):
+                        for i in range(len(cfg['fs_subvolume_groups'])):
+                            operations.append(('fs_subvolume_groups', i))
+                    if cfg.get('fs_subvolumes'):
+                        for i in range(len(cfg['fs_subvolumes'])):
+                            operations.append(('fs_subvolumes', i))
+                    if cfg.get('nfs_exports'):
+                        for i in range(len(cfg['nfs_exports'])):
+                            operations.append(('nfs_exports', i))
+
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    for op, idx_val in operations:
+                        status_queue.put({
+                            'config_idx': idx,
+                            'operation': op,
+                            'status': 'failed',
+                            'item_index': idx_val,
+                            'timestamp': timestamp
+                        })
                     logger.exception('Configuration %d execution failed', idx)
+
+        # Status updates are now applied immediately, no need to process queue
 
         # Calculate summary
         succeeded = sum(1 for r in config_results if r['success'])
@@ -417,7 +608,8 @@ class StorageProvision(RESTController):
     def _execute_single_config(
         self,
         config: Dict[str, Any],
-        index: int = 0
+        index: int = 0,
+        status_callback=None
     ) -> ProvisionResult:
         """
         Execute a single provision configuration.
@@ -431,12 +623,7 @@ class StorageProvision(RESTController):
             config = config['configure_nfs_cephfs_export']
 
         # Determine config name from service_id or volume name
-        config_name = 'config_{}'.format(index)
-        nfs_service_config = config.get('nfs_service')
-        if nfs_service_config and nfs_service_config.get('service_id'):
-            config_name = 'nfs_{}'.format(nfs_service_config['service_id'])
-        elif config.get('fs_volume', {}).get('name'):
-            config_name = 'fs_{}'.format(config['fs_volume']['name'])
+        config_name = self._get_config_name(config, index)
 
         result = ProvisionResult(
             config_id=str(index),
@@ -444,17 +631,61 @@ class StorageProvision(RESTController):
         )
 
         # Step 1: Apply NFS Service Specification
+        nfs_service_config = config.get('nfs_service')
+        if nfs_service_config and status_callback:
+            status_callback(index, 'nfs_service', 'running')
+        initial_result_count = len(result.results)
         self._apply_nfs_service(nfs_service_config, result)
+        if nfs_service_config and status_callback:
+            # Check if this operation succeeded by looking at the last result
+            latest_results = result.results[initial_result_count:]
+            operation_failed = any(r['status'] == 'failed' for r in latest_results)
+            status = 'failed' if operation_failed else 'completed'
+            status_callback(index, 'nfs_service', status)
 
         # Step 2: Create CephFS Volume
-        self._create_fs_volume(config.get('fs_volume'), result)
+        fs_volume_config = config.get('fs_volume')
+        if fs_volume_config and status_callback:
+            status_callback(index, 'fs_volume', 'running')
+        initial_result_count = len(result.results)
+        self._create_fs_volume(fs_volume_config, result)
+        if fs_volume_config and status_callback:
+            latest_results = result.results[initial_result_count:]
+            operation_failed = any(r['status'] == 'failed' for r in latest_results)
+            status = 'failed' if operation_failed else 'completed'
+            status_callback(index, 'fs_volume', status)
 
         # Step 3: Create Subvolume Groups
         subvol_groups = config.get('fs_subvolume_groups')
+        if subvol_groups and status_callback:
+            for group_idx, group in enumerate(subvol_groups):
+                status_callback(index, 'fs_subvolume_groups', 'running', group_idx)
+        initial_result_count = len(result.results)
         self._create_subvolume_groups(subvol_groups, result)
+        if subvol_groups and status_callback:
+            latest_results = result.results[initial_result_count:]
+            # Check each subvolume group individually
+            for group_idx, group in enumerate(subvol_groups):
+                group_results = [r for r in latest_results if f'group[{group_idx}]' in r['operation']]
+                operation_failed = any(r['status'] == 'failed' for r in group_results)
+                status = 'failed' if operation_failed else 'completed'
+                status_callback(index, 'fs_subvolume_groups', status, group_idx)
 
         # Step 4: Create Subvolumes
-        self._create_subvolumes(config.get('fs_subvolumes'), result)
+        subvolumes = config.get('fs_subvolumes')
+        if subvolumes and status_callback:
+            for subvol_idx, subvol in enumerate(subvolumes):
+                status_callback(index, 'fs_subvolumes', 'running', subvol_idx)
+        initial_result_count = len(result.results)
+        self._create_subvolumes(subvolumes, result)
+        if subvolumes and status_callback:
+            latest_results = result.results[initial_result_count:]
+            # Check each subvolume individually
+            for subvol_idx, subvol in enumerate(subvolumes):
+                subvol_results = [r for r in latest_results if f'[{subvol_idx}]' in r['operation']]
+                operation_failed = any(r['status'] == 'failed' for r in subvol_results)
+                status = 'failed' if operation_failed else 'completed'
+                status_callback(index, 'fs_subvolumes', status, subvol_idx)
 
         # Step 5: Wait for NFS service if we created one and have exports
         nfs_exports = config.get('nfs_exports')
@@ -464,223 +695,97 @@ class StorageProvision(RESTController):
                 self._wait_for_nfs_service(service_id, result)
 
         # Step 6: Create NFS Exports
+        if nfs_exports and status_callback:
+            for export_idx, export in enumerate(nfs_exports):
+                status_callback(index, 'nfs_exports', 'running', export_idx)
+        initial_result_count = len(result.results)
         self._create_nfs_exports(nfs_exports, result)
+        if nfs_exports and status_callback:
+            latest_results = result.results[initial_result_count:]
+            # Check each export individually
+            for export_idx, export in enumerate(nfs_exports):
+                export_results = [r for r in latest_results if f'[{export_idx}]' in r['operation']]
+                operation_failed = any(r['status'] == 'failed' for r in export_results)
+                status = 'failed' if operation_failed else 'completed'
+                status_callback(index, 'nfs_exports', status, export_idx)
 
         return result
 
-    @Endpoint('POST', path='/nfs-cephfs/yaml')
-    @CreatePermission
-    @EndpointDoc(
-        "Provision NFS export over CephFS from YAML",
-        parameters={'yaml_config': (str, 'YAML configuration string')},
-        responses={200: PROVISION_RESULT_SCHEMA}
-    )
-    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
-    def provision_nfs_cephfs_yaml(self, yaml_config: str) -> Dict[str, Any]:
+    def _get_config_name(self, config: Dict[str, Any], index: int) -> str:
         """
-        Provision NFS export over CephFS from YAML configuration.
+        Get a descriptive name for a configuration.
 
-        Supports both single configuration and batch (list) configurations.
-        If a list is provided, executes all configurations in parallel.
-
-        :param yaml_config: YAML configuration string
-        :return: Dictionary with success status and operation results
+        :param config: Configuration dictionary
+        :param index: Configuration index
+        :return: Configuration name
         """
-        try:
-            if not yaml_config:
-                raise DashboardException(
-                    msg='yaml_config parameter is required',
-                    component='storage_provision'
-                )
-
-            logger.info('Received YAML config of length %d', len(yaml_config))
-
-            try:
-                config = yaml.safe_load(yaml_config)
-            except yaml.YAMLError as e:
-                raise DashboardException(
-                    msg='Invalid YAML configuration: {}'.format(str(e)),
-                    component='storage_provision'
-                ) from e
-
-            if config is None:
-                raise DashboardException(
-                    msg='YAML configuration is empty or invalid',
-                    component='storage_provision'
-                )
-
-            logger.info('Parsed YAML config type: %s', type(config).__name__)
-
-            # Check if it's a list of configurations
-            if isinstance(config, list):
-                # Execute batch directly to avoid endpoint parameter issues
-                return self._execute_batch(
-                    configs=config,
-                    parallel=True,
-                    max_workers=4
-                )
-
-            # Check if 'configs' key is present (batch format)
-            if isinstance(config, dict) and 'configs' in config:
-                return self._execute_batch(
-                    configs=config['configs'],
-                    parallel=config.get('parallel', True),
-                    max_workers=config.get('max_workers', 4)
-                )
-
-            # Single configuration - call internal method directly
-            result = self._execute_single_config(config)
-            return result.to_dict()
-
-        except DashboardException:
-            raise
-        except Exception as e:
-            logger.exception('Unexpected error in provision_nfs_cephfs_yaml')
-            raise DashboardException(
-                msg='Unexpected error: {}'.format(str(e)),
-                component='storage_provision'
-            ) from e
-
-    @Endpoint('POST', path='/nfs-cephfs/yaml/async')
-    @CreatePermission
-    @EndpointDoc(
-        "Provision NFS/CephFS from YAML (async/background task)",
-        parameters={'yaml_config': (str, 'YAML configuration string')},
-        responses={
-            200: PROVISION_RESULT_SCHEMA,
-            202: {'name': (str, 'Task name'), 'metadata': (dict, 'Task info')}
-        }
-    )
-    @RESTController.MethodMap(version=APIVersion(1, 0))  # type: ignore
-    @provision_task('nfs_cephfs_yaml', {}, wait_for=5.0)
-    def provision_nfs_cephfs_yaml_async(
-        self,
-        yaml_config: str
-    ) -> Dict[str, Any]:
-        """
-        Provision NFS/CephFS from YAML as a background task.
-
-        Returns immediately with task info if operation takes > 5 seconds.
-        Check status: GET /api/task?name=storage_provision/nfs_cephfs_yaml
-
-        :param yaml_config: YAML configuration string
-        :return: Dictionary with success status and operation results
-        """
-        # Parse YAML
-        if not yaml_config:
-            raise DashboardException(
-                msg='yaml_config parameter is required',
-                component='storage_provision'
-            )
-
-        try:
-            config = yaml.safe_load(yaml_config)
-        except yaml.YAMLError as e:
-            raise DashboardException(
-                msg='Invalid YAML configuration: {}'.format(str(e)),
-                component='storage_provision'
-            ) from e
-
-        if config is None:
-            raise DashboardException(
-                msg='YAML configuration is empty or invalid',
-                component='storage_provision'
-            )
-
-        # Check if it's a list of configurations
-        if isinstance(config, list):
-            return self._execute_batch(
-                configs=config, parallel=True, max_workers=4
-            )
-
-        # Check if 'configs' key is present (batch format)
-        if isinstance(config, dict) and 'configs' in config:
-            return self._execute_batch(
-                configs=config['configs'],
-                parallel=config.get('parallel', True),
-                max_workers=config.get('max_workers', 4)
-            )
-
-        # Single configuration
-        result = self._execute_single_config(config)
-        return result.to_dict()
-
-    @Endpoint('POST', path='/validate')
-    @ReadPermission
-    @EndpointDoc(
-        "Validate provision configuration",
-        parameters={'config': (dict, 'Provision configuration')},
-        responses={200: {'valid': (bool, ''), 'errors': ([str], '')}}
-    )
-    def validate_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Validate provision configuration without executing.
-
-        :param config: Configuration dictionary to validate
-        :return: Dictionary with validation result and any errors
-        """
-        errors = []
-
         # Extract configuration from the wrapper if present
         if 'configure_nfs_cephfs_export' in config:
             config = config['configure_nfs_cephfs_export']
 
-        # Validate NFS service config
-        nfs_service = config.get('nfs_service')
-        if nfs_service:
-            if not nfs_service.get('service_id'):
-                errors.append('nfs_service.service_id is required')
+        # Determine config name from service_id or volume name
+        config_name = f'config_{index}'
+        nfs_service_config = config.get('nfs_service')
+        if nfs_service_config and nfs_service_config.get('service_id'):
+            config_name = f'nfs_{nfs_service_config["service_id"]}'
+        elif config.get('fs_volume', {}).get('name'):
+            config_name = f'fs_{config["fs_volume"]["name"]}'
 
-        # Validate fs_volume config
-        fs_volume = config.get('fs_volume')
-        if fs_volume:
-            if not fs_volume.get('name'):
-                errors.append('fs_volume.name is required')
+        return config_name
 
-        # Validate subvolume groups
-        subvol_groups = config.get('fs_subvolume_groups', [])
-        for i, group in enumerate(subvol_groups):
-            if not group.get('vol_name'):
-                errors.append(
-                    'fs_subvolume_groups[{}].vol_name is required'.format(i)
-                )
-            if not group.get('group_name'):
-                errors.append(
-                    'fs_subvolume_groups[{}].group_name is required'.format(i)
-                )
+    def _update_subtask_status(self, config_idx: int, operation: str, status: str,
+                              item_index: Optional[int] = None, status_queue: Optional[Queue] = None):
+        """Update the status of a specific subtask."""
+        current_task = TaskManager.current_task()
+        if not current_task:
+            return
 
-        # Validate subvolumes
-        subvols = config.get('fs_subvolumes', [])
-        for i, subvol in enumerate(subvols):
-            if not subvol.get('vol_name'):
-                errors.append(
-                    'fs_subvolumes[{}].vol_name is required'.format(i)
-                )
-            if not subvol.get('sub_name'):
-                errors.append(
-                    'fs_subvolumes[{}].sub_name is required'.format(i)
-                )
+        timestamp = datetime.now(timezone.utc).isoformat()
 
-        # Validate NFS exports
-        exports = config.get('nfs_exports', [])
-        for i, export in enumerate(exports):
-            if not export.get('cluster_id'):
-                errors.append(
-                    'nfs_exports[{}].cluster_id is required'.format(i)
-                )
-            if not export.get('pseudo_path'):
-                errors.append(
-                    'nfs_exports[{}].pseudo_path is required'.format(i)
-                )
-            if not export.get('fsname'):
-                errors.append(
-                    'nfs_exports[{}].fsname is required'.format(i)
-                )
+        # Apply the update immediately using the task's lock for thread safety
+        with current_task.lock:
+            self._apply_subtask_update(current_task, config_idx, operation, status, item_index, timestamp)
 
-        return {
-            'valid': len(errors) == 0,
-            'errors': errors
-        }
+        # For backward compatibility, also put in queue if provided (though not used for immediate updates)
+        if status_queue is not None:
+            status_queue.put({
+                'config_idx': config_idx,
+                'operation': operation,
+                'status': status,
+                'item_index': item_index,
+                'timestamp': timestamp
+            })
+
+    def _apply_subtask_update(self, current_task, config_idx: int, operation: str, status: str,
+                            item_index: Optional[int], timestamp: str):
+        """Apply a subtask status update to the task metadata."""
+        # Find the correct subtask key
+        if operation in ['nfs_service', 'fs_volume']:
+            subtask_key = f'config_{config_idx}_{operation}'
+        elif operation == 'fs_subvolume_groups':
+            subtask_key = f'config_{config_idx}_subvol_group_{item_index}'
+        elif operation == 'fs_subvolumes':
+            subtask_key = f'config_{config_idx}_subvolume_{item_index}'
+        elif operation == 'nfs_exports':
+            subtask_key = f'config_{config_idx}_nfs_export_{item_index}'
+        else:
+            return  # Unknown operation
+
+        # Find and update the subtask
+        for subtask in current_task.metadata.get('subtasks', []):
+            if subtask['name'] == subtask_key:
+                old_status = subtask.get('status')
+                subtask['status'] = status
+
+                # Add begin_time when status changes to running (only if not already set)
+                if status == 'running' and old_status != 'running' and 'begin_time' not in subtask:
+                    subtask['begin_time'] = timestamp
+
+                # Add end_time when status changes to completed or failed
+                elif status in ['completed', 'failed'] and 'end_time' not in subtask:
+                    subtask['end_time'] = timestamp
+
+                break
 
     def _apply_nfs_service(
         self,
@@ -1063,6 +1168,9 @@ class StorageProvision(RESTController):
                     'Created subvolume group: %s/%s', vol_name, group_name
                 )
 
+                # Add a small delay to ensure the subvolume group is available
+                time.sleep(1)
+
                 # Set quota if max_files is specified
                 if isinstance(quota_config, dict):
                     max_files = quota_config.get('max_files')
@@ -1221,6 +1329,58 @@ class StorageProvision(RESTController):
                 )
                 logger.exception('Failed to create subvolume %d', i)
 
+    def _wait_for_cephfs_path(
+        self,
+        fsname: str,
+        path: str,
+        result: ProvisionResult,
+        operation_name: str,
+        timeout: int = 30,
+        poll_interval: int = 2
+    ):
+        """
+        Wait for a CephFS path to exist.
+
+        :param fsname: CephFS filesystem name
+        :param path: Path to wait for
+        :param result: ProvisionResult to record status
+        :param operation_name: Name of the operation for logging
+        :param timeout: Maximum time to wait in seconds
+        :param poll_interval: Time between checks in seconds
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Try to stat the path using CephFS service
+                cfs = CephFSService(fsname)
+                # Check if path exists by trying to get its info
+                try:
+                    cfs.get_directory(path)
+                    result.add_success(
+                        operation_name,
+                        'Path {} is now available in {}'.format(path, fsname),
+                        {'fsname': fsname, 'path': path,
+                         'wait_time': int(time.time() - start_time)}
+                    )
+                    return
+                except Exception:
+                    pass  # Path doesn't exist yet
+            except Exception as e:
+                logger.debug('Error checking path %s: %s', path, str(e))
+
+            time.sleep(poll_interval)
+
+        # Timeout reached
+        result.add_failure(
+            operation_name,
+            'Timeout waiting for path {} to exist in {}'.format(path, fsname),
+            {
+                'fsname': fsname,
+                'path': path,
+                'timeout': timeout
+            }
+        )
+
     def _create_nfs_exports(
         self,
         nfs_exports: Optional[List[Dict]],
@@ -1254,6 +1414,11 @@ class StorageProvision(RESTController):
                 squash = export_config.get('squash', 'no_root_squash')
                 client_addr = export_config.get('client_addr', [])
                 access_type = 'RO' if readonly else 'RW'
+
+                # Wait for the path to exist if it's not the root
+                if path != '/':
+                    op_name = 'create_nfs_export[{}]'.format(i)
+                    self._wait_for_cephfs_path(fsname, path, result, op_name)
 
                 # Get the export manager from nfs module
                 export_mgr = mgr.remote('nfs', 'fetch_nfs_export_obj')
@@ -1360,69 +1525,3 @@ class StorageProvision(RESTController):
                     {'error': str(e), 'config': export_config}
                 )
                 logger.exception('Failed to create NFS export %d', i)
-
-    @Endpoint('GET', path='/status')
-    @ReadPermission
-    @EndpointDoc("Get storage provision service status")
-    def status(self) -> Dict[str, Any]:
-        """
-        Get status of storage provision service and its dependencies.
-
-        :return: Dictionary with service status information
-        """
-        status: Dict[str, Any] = {
-            'available': True,
-            'orchestrator': {'available': False, 'message': ''},
-            'cephfs': {'available': False, 'message': ''},
-            'nfs': {'available': False, 'message': ''},
-        }
-
-        # Check orchestrator
-        try:
-            orch = OrchClient.instance()
-            orch_status = orch.status()
-            status['orchestrator'] = {
-                'available': orch_status.get('available', False),
-                'message': orch_status.get('message', '')
-            }
-        except Exception as e:  # pylint: disable=broad-except
-            status['orchestrator'] = {
-                'available': False,
-                'message': str(e)
-            }
-
-        # Check CephFS via mgr.remote()
-        try:
-            filesystems = CephFSService.list_filesystems()
-            status['cephfs'] = {
-                'available': True,
-                'message': 'CephFS is available',
-                'filesystems_count': len(filesystems) if filesystems else 0
-            }
-        except Exception as e:  # pylint: disable=broad-except
-            status['cephfs'] = {
-                'available': False,
-                'message': str(e)
-            }
-
-        # Check NFS via mgr.remote()
-        try:
-            mgr.remote('nfs', 'cluster_ls')
-            status['nfs'] = {
-                'available': True,
-                'message': 'NFS-Ganesha is available'
-            }
-        except Exception as e:  # pylint: disable=broad-except
-            status['nfs'] = {
-                'available': False,
-                'message': str(e)
-            }
-
-        # Overall availability
-        status['available'] = all([
-            status['orchestrator']['available'],
-            status['cephfs']['available'],
-            status['nfs']['available']
-        ])
-
-        return status

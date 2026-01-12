@@ -34,6 +34,13 @@ class Task(RESTController):
         executing_t, finished_t = TaskManager.list_serializable(name)
 
         e, f = progress.get_progress_tasks()
+
+        # Filter progress tasks by name if specified
+        if name:
+            import fnmatch
+            e = [t for t in e if fnmatch.fnmatch(t['name'], name)]
+            f = [t for t in f if fnmatch.fnmatch(t['name'], name)]
+
         executing_t.extend(e)
         finished_t.extend(f)
 
