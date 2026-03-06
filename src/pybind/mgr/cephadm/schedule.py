@@ -175,6 +175,18 @@ class DaemonPlacement(NamedTuple):
                     return False
         return True
 
+    def matches_daemon_ignore_network(self, dd: DaemonDescription) -> bool:
+        """True if daemon matches this placement on type, host, and name (ignoring port/ip).
+        Used to detect when only port/ip changed so we can redeploy instead of remove+add.
+        """
+        if self.daemon_type != dd.daemon_type:
+            return False
+        if self.hostname != dd.hostname:
+            return False
+        if self.name and self.name != dd.daemon_id:
+            return False
+        return True
+
     def matches_rank_map(
             self,
             dd: DaemonDescription,
@@ -324,7 +336,7 @@ class HostAssignment(object):
         return slots, to_add, to_remove
 
     def place(self):
-        # type: () -> Tuple[List[DaemonPlacement], List[DaemonPlacement], List[orchestrator.DaemonDescription]]
+        # type: () -> Tuple[List[DaemonPlacement], List[DaemonPlacement], List[orchestrator.DaemonDescription], List[orchestrator.DaemonDescription]]
         """
         Generate a list of HostPlacementSpec taking into account:
 
@@ -382,6 +394,7 @@ class HostAssignment(object):
         existing_slots: List[DaemonPlacement] = []
         to_add: List[DaemonPlacement] = []
         to_remove: List[orchestrator.DaemonDescription] = []
+        to_redeploy: List[orchestrator.DaemonDescription] = []
         ranks: List[int] = list(range(len(candidates)))
         others: List[DaemonPlacement] = candidates.copy()
         for dd in daemons:
@@ -400,6 +413,25 @@ class HostAssignment(object):
                     existing_slots.append(p)
                     found = True
                     break
+            if not found and not self.upgrade_in_progress:
+                # Check if only port/ip changed: same daemon slot, redeploy with new config
+                for p in others:
+                    if (p.matches_daemon_ignore_network(dd) and p.matches_rank_map(dd, self.rank_map, ranks)
+                            and ((p.ports or dd.ports) and p.ports != (dd.ports or [])
+                                 or (p.ip or dd.ip) and p.ip != dd.ip)):
+                        others.remove(p)
+                        if dd.is_active:
+                            existing_active.append(dd)
+                        else:
+                            existing_standby.append(dd)
+                        if dd.rank is not None:
+                            assert dd.rank_generation is not None
+                            p = p.assign_rank(dd.rank, dd.rank_generation)
+                            ranks.remove(dd.rank)
+                        existing_slots.append(p)
+                        to_redeploy.append(dd)
+                        found = True
+                        break
             if not found:
                 to_remove.append(dd)
 
@@ -440,7 +472,8 @@ class HostAssignment(object):
             if need <= 0:
                 to_remove.extend(existing[count:])
                 del existing_slots[count:]
-                return self.place_per_host_daemons(existing_slots, [], to_remove)
+                slots, add, remove = self.place_per_host_daemons(existing_slots, [], to_remove)
+                return slots, add, remove, to_redeploy
 
             if self.related_service_daemons:
                 # prefer to put daemons on the same host(s) as daemons of the related service
@@ -480,7 +513,8 @@ class HostAssignment(object):
                 to_add[i] = to_add[i].assign_rank_generation(ranks[i], self.rank_map)
 
         logger.debug('Combine hosts with existing daemons %s + new hosts %s' % (existing, to_add))
-        return self.place_per_host_daemons(existing_slots + to_add, to_add, to_remove)
+        slots, add, remove = self.place_per_host_daemons(existing_slots + to_add, to_add, to_remove)
+        return slots, add, remove, to_redeploy
 
     def find_ip_on_host(self, hostname: str, subnets: List[str]) -> Optional[str]:
         for subnet in subnets:

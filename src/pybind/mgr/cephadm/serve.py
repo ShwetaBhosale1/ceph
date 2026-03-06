@@ -861,10 +861,10 @@ class CephadmServe:
         )
 
         try:
-            all_slots, slots_to_add, daemons_to_remove = ha.place()
+            all_slots, slots_to_add, daemons_to_remove, daemons_to_redeploy = ha.place()
             daemons_to_remove = [d for d in daemons_to_remove if (d.hostname and self.mgr.inventory._inventory[d.hostname].get(
                 'status', '').lower() not in ['maintenance', 'offline'] and d.hostname not in self.mgr.offline_hosts)]
-            self.log.debug('Add %s, remove %s' % (slots_to_add, daemons_to_remove))
+            self.log.debug('Add %s, remove %s, redeploy %s', slots_to_add, daemons_to_remove, daemons_to_redeploy)
         except OrchestratorError as e:
             msg = f'Failed to apply {spec.service_name()} spec {spec}: {str(e)}'
             self.log.error(msg)
@@ -894,8 +894,10 @@ class CephadmServe:
             delta += [f'+{len(slots_to_add)}']
         if daemons_to_remove:
             delta += [f'-{len(daemons_to_remove)}']
+        if daemons_to_redeploy:
+            delta += [f'~{len(daemons_to_redeploy)}']
         progress_title = f'Updating {spec.service_name()} deployment ({" ".join(delta)} -> {len(all_slots)})'
-        progress_total = len(slots_to_add) + len(daemons_to_remove)
+        progress_total = len(slots_to_add) + len(daemons_to_remove) + len(daemons_to_redeploy)
         progress_done = 0
 
         def update_progress() -> None:
@@ -911,8 +913,18 @@ class CephadmServe:
 
         self.log.debug('Hosts that will receive new daemons: %s' % slots_to_add)
         self.log.debug('Daemons that will be removed: %s' % daemons_to_remove)
+        self.log.debug('Daemons that will be redeployed (port/config change): %s', daemons_to_redeploy)
 
         hosts_altered: Set[str] = set()
+
+        # Schedule redeploy for daemons that only had port/ip config change
+        for d in daemons_to_redeploy:
+            self.mgr._schedule_daemon_action(d.name(), 'redeploy')
+            progress_done += 1
+            update_progress()
+            if d.hostname:
+                hosts_altered.add(d.hostname)
+            self.mgr.spec_store.mark_needs_configuration(spec.service_name())
 
         try:
             # assign names
@@ -1300,7 +1312,7 @@ class CephadmServe:
                     daemons=[],
                     networks=self.mgr.cache.networks,
                 )
-                all_slots, _, _ = ha.place()
+                all_slots, _, _, _ = ha.place()
                 for host in {s.hostname for s in all_slots}:
                     if host not in client_files:
                         client_files[host] = {}
@@ -1331,7 +1343,7 @@ class CephadmServe:
                     daemons=[],
                     networks=self.mgr.cache.networks,
                 )
-                all_slots, _, _ = ha.place()
+                all_slots, _, _, _ = ha.place()
                 for host in {s.hostname for s in all_slots}:
                     if host not in client_files:
                         client_files[host] = {}
