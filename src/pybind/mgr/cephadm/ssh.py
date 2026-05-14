@@ -8,7 +8,7 @@ from threading import Thread
 from contextlib import contextmanager
 from io import StringIO
 from shlex import quote
-from typing import TYPE_CHECKING, Optional, List, Tuple, Dict, Iterator, TypeVar, Awaitable, Union
+from typing import TYPE_CHECKING, Optional, List, Tuple, Dict, Iterator, TypeVar, Awaitable, Union, Any
 from orchestrator import OrchestratorError
 
 try:
@@ -284,7 +284,7 @@ class SSHManager:
     async def _execute_command(self,
                                host: str,
                                cmd_components: RemoteCommand,
-                               stdin: Optional[str] = None,
+                               stdin: Optional[Union[str, bytes]] = None,
                                addr: Optional[str] = None,
                                log_command: Optional[bool] = True,
                                ) -> Tuple[str, str, int]:
@@ -305,7 +305,13 @@ class SSHManager:
         # Retry logic for transient connection/channel errors
         for attempt in range(self.SSH_RETRY_COUNT):
             try:
-                r = await conn.run(str(rcmd), input=stdin)
+                run_kw: Dict[str, Any] = {}
+                if stdin is not None:
+                    run_kw['input'] = stdin
+                    # Bytes stdin: use encoding=None (else asyncssh expects str).
+                    if isinstance(stdin, bytes):
+                        run_kw['encoding'] = None
+                r = await conn.run(str(rcmd), **run_kw)
                 break  # Success, exit retry loop
             # Handle retryable exceptions (connection/channel errors)
             # Note: handle these Exceptions otherwise you might get a weird error like
@@ -398,7 +404,7 @@ class SSHManager:
     def execute_command(self,
                         host: str,
                         cmd: RemoteCommand,
-                        stdin: Optional[str] = None,
+                        stdin: Optional[Union[str, bytes]] = None,
                         addr: Optional[str] = None,
                         log_command: Optional[bool] = True
                         ) -> Tuple[str, str, int]:
@@ -408,7 +414,7 @@ class SSHManager:
     async def _check_execute_command(self,
                                      host: str,
                                      cmd: RemoteCommand,
-                                     stdin: Optional[str] = None,
+                                     stdin: Optional[Union[str, bytes]] = None,
                                      addr: Optional[str] = None,
                                      log_command: Optional[bool] = True
                                      ) -> str:
@@ -422,7 +428,7 @@ class SSHManager:
     def check_execute_command(self,
                               host: str,
                               cmd: RemoteCommand,
-                              stdin: Optional[str] = None,
+                              stdin: Optional[Union[str, bytes]] = None,
                               addr: Optional[str] = None,
                               log_command: Optional[bool] = True,
                               ) -> str:
@@ -438,6 +444,9 @@ class SSHManager:
                                  gid: Optional[int] = None,
                                  addr: Optional[str] = None,
                                  ) -> None:
+        """This method will be used to only write cephadm binary when sudo_hardening is disbaled.
+        Other host files are written via ``cephadm deploy-file`` on the target host.
+        """
         try:
             cephadm_tmp_dir = f"/tmp/cephadm-{self.mgr._cluster_fsid}"
             dirname = os.path.dirname(path)
@@ -516,19 +525,6 @@ class SSHManager:
                 os.unlink(local_tmp_path)
             except OSError:
                 pass
-
-    def write_remote_file(self,
-                          host: str,
-                          path: str,
-                          content: bytes,
-                          mode: Optional[int] = None,
-                          uid: Optional[int] = None,
-                          gid: Optional[int] = None,
-                          addr: Optional[str] = None,
-                          ) -> None:
-        with self.mgr.async_timeout_handler(host, f'writing file {path}'):
-            self.mgr.wait_async(self._write_remote_file(
-                host, path, content, mode, uid, gid, addr))
 
     async def _reset_con(self, host: str) -> None:
         conn = self.cons.get(host)
