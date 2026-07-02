@@ -5,6 +5,7 @@ import pytest
 
 from cephadm.services.service_registry import service_registry
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
+from cephadm import utils
 from cephadm.module import CephadmOrchestrator
 from ceph.deployment.service_spec import (
     NFSServiceSpec,
@@ -740,3 +741,35 @@ def test_ingress_for_nfs_choose_next_action(cephadm_module, mock_cephadm):
         # _daemon_action so we can check what action was chosen
         mock_cephadm.serve(cephadm_module)._check_daemons()
         mock_cephadm._daemon_action.assert_called_with(ANY, action="redeploy")
+
+
+def test_nfs_choose_next_action_skips_legacy_default_deps():
+    nfs_svc = service_registry.get_service('nfs')
+    legacy_deps = [
+        'enable_rdma: False',
+        'rdma_port: None',
+        'tls_ktls: False',
+        'tls_debug: False',
+        'tls_min_version: None',
+        'tls_ciphers: None',
+    ]
+    step = nfs_svc.choose_next_action(
+        utils.Action.NO_ACTION,
+        'nfs',
+        None,
+        curr_deps=[],
+        last_deps=legacy_deps,
+    )
+    assert step.action is utils.Action.NO_ACTION
+
+
+def test_nfs_choose_next_action_detects_explicit_value_change():
+    nfs_svc = service_registry.get_service('nfs')
+    step = nfs_svc.choose_next_action(
+        utils.Action.NO_ACTION,
+        'nfs',
+        None,
+        curr_deps=['tls_ktls: True'],
+        last_deps=['tls_ktls: False'],
+    )
+    assert step.action is utils.Action.REDEPLOY
