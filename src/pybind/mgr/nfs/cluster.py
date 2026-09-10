@@ -213,6 +213,7 @@ class NFSCluster:
             enable_rdma: bool = False,
             rdma_port: Optional[int] = None,
             ingress_placement: Optional[str] = None,
+            clients_per_pool: Optional[int] = None,
     ) -> None:
         if not port:
             port = 2049   # default nfs port
@@ -264,7 +265,8 @@ class NFSCluster:
                                   monitoring_ip_addrs=monitoring_ip_addrs,
                                   monitoring_port=monitoring_port,
                                   enable_rdma=enable_rdma,
-                                  rdma_port=rdma_port)
+                                  rdma_port=rdma_port,
+                                  clients_per_pool=clients_per_pool)
             completion = self.mgr.apply_nfs(spec)
             orchestrator.raise_if_exception(completion)
             ispec = IngressSpec(service_type='ingress',
@@ -297,7 +299,8 @@ class NFSCluster:
                                   monitoring_ip_addrs=monitoring_ip_addrs,
                                   monitoring_port=monitoring_port,
                                   enable_rdma=enable_rdma,
-                                  rdma_port=rdma_port)
+                                  rdma_port=rdma_port,
+                                  clients_per_pool=clients_per_pool)
             completion = self.mgr.apply_nfs(spec)
             orchestrator.raise_if_exception(completion)
         log.debug("Successfully deployed nfs daemons with cluster id %s and placement %s",
@@ -337,6 +340,7 @@ class NFSCluster:
             enable_rdma: bool = False,
             rdma_port: Optional[int] = None,
             ingress_placement: Optional[str] = None,
+            clients_per_pool: Optional[int] = None,
     ) -> None:
         try:
             if virtual_ip:
@@ -381,7 +385,8 @@ class NFSCluster:
                     monitoring_port=monitoring_port,
                     enable_rdma=enable_rdma,
                     rdma_port=rdma_port,
-                    ingress_placement=ingress_placement
+                    ingress_placement=ingress_placement,
+                    clients_per_pool=clients_per_pool
                 )
                 return
             raise NonFatalError(f"{cluster_id} cluster already exists")
@@ -655,6 +660,7 @@ class NFSCluster:
 
         deployment_type = "standalone"
         placement = None
+        clients_per_pool = None
 
         nfs_sc = self.mgr.describe_service(
             service_type='nfs',
@@ -664,6 +670,7 @@ class NFSCluster:
         for svc in nfs_services:
             if svc.spec.service_id == cluster_id:
                 placement = svc.spec.placement
+                clients_per_pool = getattr(svc.spec, 'clients_per_pool', None)
                 break
 
         if ingress_mode:
@@ -687,6 +694,8 @@ class NFSCluster:
             r['port'] = ingress_port
         if monitor_port is not None:
             r['monitor_port'] = monitor_port
+        if clients_per_pool is not None:
+            r['clients_per_pool'] = clients_per_pool
 
         log.debug("Successfully fetched %s info: %s", cluster_id, r)
         return r
