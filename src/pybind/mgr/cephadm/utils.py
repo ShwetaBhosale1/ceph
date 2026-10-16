@@ -95,6 +95,19 @@ def allowed_ciphers_are_aes256k_only(cipher_names: List[str]) -> bool:
     return names == {ROTATION_CIPHER}
 
 
+def auth_service_cipher_name_from_mon_map(mon_map: Any) -> Optional[str]:
+    """Return the auth_service_cipher name from a MonMap dump, if it reports one."""
+    if not isinstance(mon_map, dict):
+        return None
+    raw = mon_map.get('auth_service_cipher')
+    if isinstance(raw, dict):
+        name = raw.get('name')
+        return str(name) if name else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 DEFAULT_SSH_CONFIG = """
 Host *
   User root

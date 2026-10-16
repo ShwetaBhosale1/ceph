@@ -8,6 +8,7 @@ from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
 from cephadm import CephadmOrchestrator
 from cephadm.upgrade import (
     CephadmUpgrade,
+    MID_UPGRADE_MUTED_WARNINGS,
     OkToUpgradeMonReport,
     UpgradeState,
     parse_ok_to_upgrade_mon_json,
@@ -1504,3 +1505,68 @@ def test_rotate_mgr_mon_auth_keys_goes_through_cipher_check(
     cephadm_module.upgrade._rotate_mgr_mon_auth_keys('target_image', ['digest1'])
 
     _maybe_set_cephx_allowed_ciphers.assert_called_once_with()
+
+
+def _set_cephx_health_state(
+    cephadm_module: CephadmOrchestrator,
+    allowed_ciphers: Optional[List[str]] = None,
+    service_cipher: Optional[str] = None,
+    raised_checks: Optional[List[str]] = None,
+) -> None:
+    """Set up mon_map ciphers and raised health checks the way the mons report them."""
+    _set_mon_map_allowed_ciphers(cephadm_module, allowed_ciphers)
+    if service_cipher is not None:
+        mon_map = dict(cephadm_module.get('mon_map'))
+        mon_map['auth_service_cipher'] = {'name': service_cipher, 'value': 0}
+        cephadm_module.mock_store_set('_ceph_get', 'mon_map', mon_map)
+    cephadm_module.mock_store_set('_ceph_get', 'health', {
+        'json': json.dumps({'checks': {c: {'detail': []} for c in (raised_checks or [])}})
+    })
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+@mock.patch("cephadm.CephadmOrchestrator.check_mon_command")
+def test_mute_upgrade_health_warnings_skipped_when_cephx_secure(
+    check_mon_command, cephadm_module: CephadmOrchestrator
+):
+    # the reported cluster: all keys already aes256k, ciphers already narrowed.
+    # Muting here only produces a misleading '(muted: AUTH_INSECURE_*)' line.
+    _set_cephx_health_state(cephadm_module, allowed_ciphers=['aes256k'],
+                            service_cipher='aes256k', raised_checks=[])
+
+    assert cephadm_module.upgrade._mute_upgrade_related_health_warnings() is False
+    check_mon_command.assert_not_called()
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+@mock.patch("cephadm.CephadmOrchestrator.check_mon_command")
+@pytest.mark.parametrize(
+    "allowed_ciphers,service_cipher,raised_checks",
+    [
+        # insecure cipher still allowed
+        pytest.param(['aes', 'aes256k'], 'aes256k', [], id='insecure-cipher-allowed'),
+        # mons still issue insecure service tickets
+        pytest.param(['aes256k'], 'aes', [], id='insecure-service-cipher'),
+        # ciphers fine, but an entity still holds a key the upgrade will rotate
+        pytest.param(['aes256k'], 'aes256k', ['AUTH_INSECURE_SERVICE_KEY_TYPE'],
+                     id='insecure-key-still-present'),
+        # mons too old to report either field: must still mute, since the checks
+        # only start existing once the mons are upgraded
+        pytest.param(None, None, [], id='mons-not-yet-upgraded'),
+    ],
+)
+def test_mute_upgrade_health_warnings_applied_when_cephx_insecure(
+    check_mon_command, allowed_ciphers, service_cipher, raised_checks,
+    cephadm_module: CephadmOrchestrator
+):
+    check_mon_command.return_value = (0, '', '')
+    _set_cephx_health_state(cephadm_module, allowed_ciphers=allowed_ciphers,
+                            service_cipher=service_cipher, raised_checks=raised_checks)
+
+    assert cephadm_module.upgrade._mute_upgrade_related_health_warnings() is True
+    assert check_mon_command.call_count == len(MID_UPGRADE_MUTED_WARNINGS)
+    check_mon_command.assert_has_calls(
+        [mock.call({'prefix': 'health mute', 'code': w, 'sticky': True})
+         for w in MID_UPGRADE_MUTED_WARNINGS],
+        any_order=True,
+    )

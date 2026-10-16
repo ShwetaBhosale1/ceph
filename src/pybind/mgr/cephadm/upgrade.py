@@ -25,6 +25,7 @@ from cephadm.utils import (
     SERVICE_CIPHER,
     allowed_ciphers_are_aes256k_only,
     auth_allowed_cipher_names_from_mon_map,
+    auth_service_cipher_name_from_mon_map,
 )
 from cephadm.ssh import HostConnectionError
 from orchestrator import OrchestratorError, DaemonDescription, DaemonDescriptionStatus, daemon_type_to_service
@@ -707,7 +708,37 @@ class CephadmUpgrade:
         """
         return f'retval: {-errno.ENOENT}' in str(err)
 
-    def _mute_upgrade_related_health_warnings(self) -> None:
+    def _should_skip_cephx_health_mutes(self) -> bool:
+        """Checked before muting: on a cluster that is already fully on aes256k the
+        upgrade has no insecure auth state to fix, so muting only produces a
+        misleading '(muted: AUTH_INSECURE_*)' line in ceph -s. Note the mutes are
+        sticky, so they are listed whether or not the alert is actually raised.
+        """
+        mon_map = self.mgr.get('mon_map')
+        # mons predating the cephx cipher settings report neither field, which
+        # leaves no names to compare and correctly reads as 'not secure yet'
+        if not allowed_ciphers_are_aes256k_only(auth_allowed_cipher_names_from_mon_map(mon_map)):
+            return False
+        # mons issuing service tickets under an insecure cipher raise
+        # AUTH_INSECURE_SERVICE_TICKETS, so read the setting rather than
+        # relying on the mons having already published that check
+        if auth_service_cipher_name_from_mon_map(mon_map) != SERVICE_CIPHER:
+            return False
+        try:
+            health_checks = json.loads(self.mgr.get('health')['json']).get('checks', {})
+        except Exception as e:
+            logger.error('Upgrade: could not read health checks (%s), assuming insecure cephx state', e)
+            return False
+        # ciphers are secure but an entity may still hold an insecure key that
+        # the upgrade is going to rotate for us
+        return not any(w in health_checks for w in MID_UPGRADE_MUTED_WARNINGS)
+
+    def _mute_upgrade_related_health_warnings(self) -> bool:
+        if self._should_skip_cephx_health_mutes():
+            logger.info(
+                'Upgrade: cephx keys and ciphers are already secure; not muting auth health warnings'
+            )
+            return False
         for health_warning_name in MID_UPGRADE_MUTED_WARNINGS:
             try:
                 self.mgr.log.info('Muting %s warning for the duration of the upgrade', health_warning_name)
@@ -720,6 +751,7 @@ class CephadmUpgrade:
                 self.mgr.log.error(
                     f'Failed to mute health warning {health_warning_name} during upgrade: {str(e)}'
                 )
+        return True
 
     def _unmute_upgrade_related_health_warnings(self) -> None:
         for health_warning_name in MID_UPGRADE_MUTED_WARNINGS:
@@ -2339,9 +2371,11 @@ class CephadmUpgrade:
         image_settings = self.get_distinct_container_image_settings()
 
         if not self.upgrade_state.health_warnings_muted:
-            self._mute_upgrade_related_health_warnings()
-            self.upgrade_state.health_warnings_muted = True
-            self._save_upgrade_state()
+            # only record the mutes when they were actually applied, so the
+            # completion path does not unmute warnings we never muted
+            if self._mute_upgrade_related_health_warnings():
+                self.upgrade_state.health_warnings_muted = True
+                self._save_upgrade_state()
         daemons = self._get_filtered_daemons()
 
         upgraded_daemon_count: int = 0
